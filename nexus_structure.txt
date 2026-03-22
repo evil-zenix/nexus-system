@@ -1,0 +1,68 @@
+nexus/
+├── .env                          # Переменные окружения (локально, в .gitignore)
+├── .env.example                  # Пример конфигурации
+├── .gitignore
+├── README.md
+│
+├── docker-compose.yml            # Оркестрация контейнеров
+├── Dockerfile                    # Базовый образ для Python сервисов
+│
+├── config/
+│   ├── __init__.py
+│   ├── settings.py              # Pydantic-конфиги для всех сервисов
+│   └── logging.py               # Логирование
+│
+├── core/
+│   ├── __init__.py
+│   ├── router/                  # FastAPI Router сервис
+│   │   ├── __init__.py
+│   │   ├── main.py              # Entry point для Роутера
+│   │   ├── app.py               # FastAPI приложение
+│   │   ├── handlers.py          # Webhook обработчики
+│   │   └── dependencies.py      # Зависимости (Redis, логирование)
+│   │
+│   ├── workers/                 # Воркеры (Consumer сервисы)
+│   │   ├── __init__.py
+│   │   ├── base_worker.py       # Базовый класс воркера
+│   │   ├── moderator.py         # Воркер модератора (спам-проверка)
+│   │   ├── osint_scraper.py     # Воркер OSINT (логирование сообщений)
+│   │   └── main.py              # Entry point для запуска воркеров
+│   │
+│   ├── storage/                 # Работа с Telegram Storage Channel
+│   │   ├── __init__.py
+│   │   └── media_handler.py     # copyMessage логика
+│   │
+│   ├── database/                # Слой данных
+│   │   ├── __init__.py
+│   │   ├── db.py                # Асинхронная сессия PostgreSQL
+│   │   ├── models.py            # SQLAlchemy ORM модели
+│   │   └── queries.py           # Запросы в БД
+│   │
+│   ├── queue/                   # Интеграция с Redis очередью
+│   │   ├── __init__.py
+│   │   ├── redis_client.py      # Redis клиент (синглтон)
+│   │   └── message_schema.py    # Схемы для очереди (Pydantic)
+│   │
+│   └── telegram/                # Telegram API утилиты
+│       ├── __init__.py
+│       ├── client.py            # Обертки над aiogram
+│       └── constants.py         # Константы (chat_id для storage и т.д.)
+│
+├── migrations/                  # Alembic миграции БД
+│   ├── alembic.ini
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions/
+│
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py              # Pytest фикстуры
+│   ├── test_router.py
+│   ├── test_workers.py
+│   └── test_database.py
+│
+├── scripts/
+│   ├── init_db.py               # Инициализация БД (создание таблиц)
+│   └── cleanup.py               # Очистка Redis/кэша
+│
+└── requirements.txt             # Python зависимости

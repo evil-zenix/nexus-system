@@ -1,0 +1,210 @@
+version: "3.9"
+
+services:
+  # ============================================================================
+  # ИНФРАСТРУКТУРА: Redis (очередь/кэш) + PostgreSQL (основная БД)
+  # ============================================================================
+
+  redis:
+    image: redis:7-alpine
+    container_name: nexus-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - nexus-network
+    environment:
+      - REDIS_LOG_LEVEL=notice
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: nexus-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${DB_NAME:-nexus_db}
+      POSTGRES_USER: ${DB_USER:-nexus_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_password_change_me}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Инициализационные скрипты (опционально)
+      - ./scripts/init_db_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${DB_USER:-nexus_user} -d ${DB_NAME:-nexus_db}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - nexus-network
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=128MB"
+      - "-c"
+      - "max_connections=50"
+
+  # ============================================================================
+  # ОСНОВНОЙ СЕРВИС: FastAPI Router (точка входа для Telegram Webhooks)
+  # ============================================================================
+
+  router:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: base
+    container_name: nexus-router
+    command: python -m core.router.main
+    ports:
+      - "8000:8000"
+    environment:
+      # Telegram
+      - TELEGRAM_TOKENS=${TELEGRAM_TOKENS}  # JSON: {"bot1": "token1", "bot2": "token2"}
+      - WEBHOOK_HOST=${WEBHOOK_HOST:-http://localhost:8000}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-change_me}
+      
+      # Redis
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      
+      # PostgreSQL
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://nexus_user:secure_password_change_me@postgres:5432/nexus_db}
+      
+      # Логирование
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./core:/app/core
+      - ./config:/app/config
+    restart: unless-stopped
+    networks:
+      - nexus-network
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ============================================================================
+  # ВОРКЕРЫ (Consumer'ы задач из Redis)
+  # ============================================================================
+
+  # Воркер №1: Модератор (спам-проверка)
+  worker-moderator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: base
+    container_name: nexus-worker-moderator
+    command: python -m core.workers.main --worker moderator
+    environment:
+      # Telegram
+      - TELEGRAM_TOKENS=${TELEGRAM_TOKENS}
+      
+      # Redis
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      
+      # PostgreSQL
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://nexus_user:secure_password_change_me@postgres:5432/nexus_db}
+      
+      # Worker config
+      - WORKER_TYPE=moderator
+      - WORKER_CONCURRENCY=5
+      - QUEUE_NAME=tasks:moderator
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      router:
+        condition: service_healthy
+    volumes:
+      - ./core:/app/core
+      - ./config:/app/config
+    restart: unless-stopped
+    networks:
+      - nexus-network
+
+  # Воркер №2: OSINT/Scraper (логирование сообщений)
+  worker-osint:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: base
+    container_name: nexus-worker-osint
+    command: python -m core.workers.main --worker osint
+    environment:
+      # Telegram
+      - TELEGRAM_TOKENS=${TELEGRAM_TOKENS}
+      - STORAGE_CHANNEL_ID=${STORAGE_CHANNEL_ID}  # Приватный чат для хранения файлов
+      
+      # Redis
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      
+      # PostgreSQL
+      - DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://nexus_user:secure_password_change_me@postgres:5432/nexus_db}
+      
+      # Worker config
+      - WORKER_TYPE=osint
+      - WORKER_CONCURRENCY=3
+      - QUEUE_NAME=tasks:osint
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      router:
+        condition: service_healthy
+    volumes:
+      - ./core:/app/core
+      - ./config:/app/config
+    restart: unless-stopped
+    networks:
+      - nexus-network
+
+  # ============================================================================
+  # ОПЦИОНАЛЬНО: PgAdmin для управления БД (только для разработки)
+  # ============================================================================
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: nexus-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    restart: unless-stopped
+    networks:
+      - nexus-network
+    profiles:
+      - dev  # Запуск только с флагом: docker-compose --profile dev up
+
+volumes:
+  redis-data:
+  postgres-data:
+  pgadmin-data:
+
+networks:
+  nexus-network:
+    driver: bridge
