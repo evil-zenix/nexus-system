@@ -1,9 +1,11 @@
 """
 Асинхронный слой для работы с PostgreSQL.
 Управление сессиями, connection pooling, инициализация БД.
+Обновлено для совместимости с SQLAlchemy 2.0.
 """
 from typing import AsyncGenerator
 
+from sqlalchemy import text  # <--- Добавлено для фикса ошибки "SELECT 1"
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     AsyncEngine,
@@ -50,7 +52,7 @@ async def init_db() -> None:
         autocommit=False,
     )
     
-    # Создать все таблицы
+    # Создать все таблицы (если их еще нет)
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
@@ -72,12 +74,7 @@ async def close_db() -> None:
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     """
-    Получить асинхронную сессию БД.
-    Использовать как зависимость в FastAPI:
-    
-    @app.get("/")
-    async def get_data(session: AsyncSession = Depends(get_session)):
-        ...
+    Получить асинхронную сессию БД для FastAPI (Depends).
     """
     if _session_factory is None:
         raise RuntimeError(
@@ -97,16 +94,8 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 async def get_db_session() -> AsyncSession:
     """
-    Получить сессию БД без контекстного менеджера.
-    Использовать когда нельзя применить Depends().
+    Получить сессию БД напрямую (например, для воркеров).
     ВАЖНО: Нужно вызвать close() вручную!
-    
-    Пример:
-        session = await get_db_session()
-        try:
-            ...
-        finally:
-            await session.close()
     """
     if _session_factory is None:
         raise RuntimeError(
@@ -118,15 +107,16 @@ async def get_db_session() -> AsyncSession:
 
 async def health_check() -> bool:
     """
-    Проверить здоровье подключения к БД.
-    Используется для health check endpoint.
-    
-    Returns:
-        True если БД доступна, False иначе
+    Проверить доступность БД.
+    Фикс SQLAlchemy 2.0: строковые запросы должны быть обернуты в text().
     """
+    if _session_factory is None:
+        return False
+        
     try:
         async with _session_factory() as session:
-            await session.execute("SELECT 1")
+            # Исправлено: добавлена обертка text()
+            await session.execute(text("SELECT 1"))
             return True
     except Exception as e:
         logger.error("💥 БД недоступна", error=str(e))
