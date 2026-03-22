@@ -2,13 +2,14 @@
 Database query функции (CRUD операции).
 Работает с SQLAlchemy асинхронно через AsyncSession.
 """
-from typing import Optional, List
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
-from sqlalchemy import select, update, delete
+from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.logging import get_logger
-from core.database.models import SystemBot, Group, User, MessageLog
+from core.database.models import SystemBot, Group, User, MessageLog, GlobalUser
 
 logger = get_logger(__name__)
 
@@ -370,3 +371,235 @@ async def get_spam_messages(
     )
     result = await session.execute(stmt)
     return result.scalars().all()
+
+
+# ============================================================================
+# GLOBAL USERS (единый кошелёк для всей сети ботов — экономика)
+# ============================================================================
+
+async def get_or_create_global_user(
+    session: AsyncSession,
+    telegram_user_id: int,
+    username: Optional[str] = None,
+    full_name: Optional[str] = None,
+) -> GlobalUser:
+    """
+    Получить или создать глобальный профиль пользователя.
+    
+    Используется при каждом сообщении для обновления кэша имени
+    и инициализации экономического профиля.
+    """
+    stmt = select(GlobalUser).where(GlobalUser.telegram_user_id == telegram_user_id)
+    result = await session.execute(stmt)
+    global_user = result.scalar_one_or_none()
+    
+    if global_user:
+        # Обновить кэшированные данные если изменились
+        changed = False
+        if username and global_user.username != username:
+            global_user.username = username
+            changed = True
+        if full_name and global_user.full_name != full_name:
+            global_user.full_name = full_name
+            changed = True
+        if changed:
+            global_user.updated_at = datetime.utcnow()
+            await session.commit()
+        return global_user
+    
+    # Создать новый глобальный профиль
+    global_user = GlobalUser(
+        telegram_user_id=telegram_user_id,
+        username=username,
+        full_name=full_name,
+        diamonds=0,
+        xp=0,
+        balance=0.0,
+    )
+    session.add(global_user)
+    await session.commit()
+    
+    logger.info(
+        "🆕 Создан глобальный профиль",
+        telegram_user_id=telegram_user_id,
+        username=username,
+    )
+    return global_user
+
+
+async def add_xp(
+    session: AsyncSession,
+    telegram_user_id: int,
+    amount: int = 10,
+) -> GlobalUser:
+    """
+    Начислить XP пользователю.
+    
+    Автоматически конвертирует XP в diamonds:
+        каждые 100 XP = 1 diamond.
+    
+    Args:
+        session: AsyncSession
+        telegram_user_id: Telegram User ID
+        amount: Количество XP для начисления (default: 10 за сообщение)
+    
+    Returns:
+        Обновлённый объект GlobalUser
+    """
+    stmt = select(GlobalUser).where(GlobalUser.telegram_user_id == telegram_user_id)
+    result = await session.execute(stmt)
+    global_user = result.scalar_one_or_none()
+    
+    if not global_user:
+        logger.warning(
+            "⚠️ Пользователь не найден в global_users при начислении XP",
+            telegram_user_id=telegram_user_id,
+        )
+        return None
+    
+    old_xp = global_user.xp
+    global_user.xp += amount
+    
+    # Конвертация XP → diamonds (каждые 100 XP = 1 diamond)
+    old_diamonds_from_xp = old_xp // 100
+    new_diamonds_from_xp = global_user.xp // 100
+    earned_diamonds = new_diamonds_from_xp - old_diamonds_from_xp
+    
+    if earned_diamonds > 0:
+        global_user.diamonds += earned_diamonds
+        logger.info(
+            "💎 Начислены diamonds за XP",
+            telegram_user_id=telegram_user_id,
+            diamonds_earned=earned_diamonds,
+            total_diamonds=global_user.diamonds,
+            total_xp=global_user.xp,
+        )
+    
+    global_user.updated_at = datetime.utcnow()
+    await session.commit()
+    return global_user
+
+
+# ============================================================================
+# OSINT LOOKUP (кросс-ботный пробив пользователя)
+# ============================================================================
+
+async def osint_lookup_user(
+    session: AsyncSession,
+    telegram_user_id: int,
+) -> Dict[str, Any]:
+    """
+    OSINT-пробив: собрать всю информацию о пользователе по всем ботам сети.
+    
+    Возвращает словарь с:
+    - global_user: глобальный профиль (XP, diamonds, balance)
+    - appearances: список чатов/ботов, где видели пользователя
+    - total_messages: суммарное количество сообщений
+    - first_seen: первое появление в сети
+    - last_seen: последнее появление в сети
+    - is_banned_anywhere: забанен ли хоть в одном месте
+    """
+    report: Dict[str, Any] = {
+        "telegram_user_id": telegram_user_id,
+        "global_user": None,
+        "appearances": [],
+        "total_messages": 0,
+        "first_seen": None,
+        "last_seen": None,
+        "is_banned_anywhere": False,
+        "is_spam_anywhere": False,
+    }
+    
+    # 1. Глобальный профиль (экономика)
+    stmt = select(GlobalUser).where(GlobalUser.telegram_user_id == telegram_user_id)
+    result = await session.execute(stmt)
+    global_user = result.scalar_one_or_none()
+    
+    if global_user:
+        report["global_user"] = {
+            "username": global_user.username,
+            "full_name": global_user.full_name,
+            "xp": global_user.xp,
+            "diamonds": global_user.diamonds,
+            "balance": global_user.balance,
+            "registered_at": global_user.created_at,
+        }
+    
+    # 2. Все записи пользователя по всем группам/ботам
+    stmt = (
+        select(User, Group, SystemBot)
+        .join(Group, User.group_id == Group.id)
+        .join(SystemBot, Group.bot_id == SystemBot.id)
+        .where(User.telegram_user_id == telegram_user_id)
+    )
+    result = await session.execute(stmt)
+    rows = result.all()
+    
+    total_messages = 0
+    first_seen = None
+    last_seen = None
+    
+    for user_row, group_row, bot_row in rows:
+        total_messages += user_row.message_count
+        
+        if user_row.is_banned:
+            report["is_banned_anywhere"] = True
+        if user_row.is_spam:
+            report["is_spam_anywhere"] = True
+        
+        # Трекинг дат
+        if user_row.first_message_date:
+            if first_seen is None or user_row.first_message_date < first_seen:
+                first_seen = user_row.first_message_date
+        if user_row.last_message_date:
+            if last_seen is None or user_row.last_message_date > last_seen:
+                last_seen = user_row.last_message_date
+        
+        report["appearances"].append({
+            "bot_name": bot_row.bot_name,
+            "bot_username": bot_row.bot_username,
+            "chat_id": group_row.telegram_chat_id,
+            "chat_title": group_row.title,
+            "chat_type": group_row.chat_type,
+            "message_count": user_row.message_count,
+            "status": user_row.status,
+            "is_banned": user_row.is_banned,
+            "first_seen": user_row.first_message_date,
+            "last_seen": user_row.last_message_date,
+        })
+    
+    report["total_messages"] = total_messages
+    report["first_seen"] = first_seen
+    report["last_seen"] = last_seen
+    
+    logger.info(
+        "🔍 OSINT lookup завершён",
+        telegram_user_id=telegram_user_id,
+        appearances=len(report["appearances"]),
+        total_messages=total_messages,
+    )
+    return report
+
+
+async def get_global_user_by_username(
+    session: AsyncSession,
+    username: str,
+) -> Optional[GlobalUser]:
+    """
+    Найти глобальный профиль пользователя по @username.
+    
+    Args:
+        session: AsyncSession
+        username: Username без @ (например: "johndoe")
+    
+    Returns:
+        GlobalUser или None если не найден
+    """
+    # Нормализация: убрать @ если передали с ним
+    clean_username = username.lstrip("@").lower()
+    
+    stmt = select(GlobalUser).where(
+        func.lower(GlobalUser.username) == clean_username
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()

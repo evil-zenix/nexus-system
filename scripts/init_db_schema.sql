@@ -1,4 +1,28 @@
+-- ============================================================================
+-- Глобальный профиль пользователя (общая экономика для всей сети ботов)
+-- Один профиль = один telegram_user_id = один кошелёк во всех botах
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS global_users (
+    id              SERIAL PRIMARY KEY,
+    telegram_user_id BIGINT UNIQUE NOT NULL,
+    username        VARCHAR(255),
+    full_name       VARCHAR(511),
+    
+    -- Экономика
+    diamonds        INTEGER     NOT NULL DEFAULT 0,
+    xp              INTEGER     NOT NULL DEFAULT 0,
+    balance         FLOAT       NOT NULL DEFAULT 0.0,
+    
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS ix_global_users_telegram_user_id ON global_users (telegram_user_id);
+CREATE INDEX IF NOT EXISTS ix_global_users_username         ON global_users (username);
+
+-- ============================================================================
 -- Таблица ботов
+
 CREATE TABLE IF NOT EXISTS system_bots (
     id SERIAL PRIMARY KEY,
     bot_id BIGINT UNIQUE NOT NULL,

@@ -1,6 +1,6 @@
 """
 SQLAlchemy ORM модели для Nexus системы.
-Асинхронные модели таблиц: system_bots, groups, users, messages_log.
+Асинхронные модели таблиц: system_bots, groups, users, messages_log, global_users.
 """
 from datetime import datetime
 from typing import Optional
@@ -9,6 +9,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -20,6 +21,61 @@ from sqlalchemy.orm import declarative_base, relationship, Mapped, mapped_column
 
 # Базовый класс для всех моделей
 Base = declarative_base()
+
+
+class GlobalUser(Base):
+    """
+    Глобальный профиль пользователя — единый кошелёк для всей сети ботов.
+    
+    Один пользователь (по telegram_user_id) имеет один набор экономических
+    атрибутов независимо от того, в скольких ботах/чатах был замечен.
+    """
+    
+    __tablename__ = "global_users"
+    __table_args__ = (
+        UniqueConstraint("telegram_user_id", name="uq_global_users_uid"),
+        Index("ix_global_users_telegram_user_id", "telegram_user_id"),
+        Index("ix_global_users_username", "username"),
+    )
+    
+    # Первичный ключ
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    
+    # Telegram User ID (уникальный в рамках всей сети)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    
+    # Кэшированный username (обновляется при каждом сообщении)
+    username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    
+    # Кэшированное полное имя
+    full_name: Mapped[Optional[str]] = mapped_column(String(511), nullable=True)
+    
+    # ===================== ЭКОНОМИКА =====================
+    
+    # Алмазы (премиальная валюта)
+    diamonds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    
+    # Опыт (накапливается за каждое сообщение)
+    xp: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    
+    # Баланс (основная игровая валюта)
+    balance: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    
+    # =====================================================
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+    
+    def __repr__(self) -> str:
+        return (
+            f"<GlobalUser(tg_id={self.telegram_user_id}, "
+            f"xp={self.xp}, diamonds={self.diamonds}, balance={self.balance})>"
+        )
 
 
 class SystemBot(Base):
