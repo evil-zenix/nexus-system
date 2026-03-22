@@ -6,7 +6,7 @@ import json
 from typing import Optional, Any, List
 from datetime import datetime
 
-import aioredis
+import redis.asyncio as redis
 from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
 
@@ -30,7 +30,7 @@ async def init_redis() -> None:
     
     try:
         # Создать асинхронный Redis клиент
-        _redis_client = await aioredis.from_url(
+        _redis_client = await redis.from_url(
             settings.redis_url,
             encoding="utf8",
             decode_responses=True,
