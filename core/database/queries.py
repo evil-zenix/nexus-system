@@ -9,7 +9,7 @@ from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.logging import get_logger
-from core.database.models import SystemBot, Group, User, MessageLog, GlobalUser, PasswordSearch
+from core.database.models import SystemBot, Group, User, MessageLog, GlobalUser, PasswordSearch, EmailSearch
 
 logger = get_logger(__name__)
 
@@ -634,4 +634,24 @@ async def save_password_search(
     )
     session.add(pw_search)
     await session.commit()
+
+
+async def save_email_search(
+    session: AsyncSession,
+    telegram_user_id: int,
+    email: str,
+) -> None:
+    """Сохранить email, который искал пользователь."""
+    stmt = select(GlobalUser).where(GlobalUser.telegram_user_id == telegram_user_id)
+    gu = (await session.execute(stmt)).scalar_one_or_none()
+    if not gu:
+        return
+        
+    email_search = EmailSearch(
+        telegram_user_id=telegram_user_id,
+        email=email,
+    )
+    session.add(email_search)
+    await session.commit()
+
 

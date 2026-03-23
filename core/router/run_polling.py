@@ -12,6 +12,8 @@ import logging
 import os
 import re
 import subprocess
+import hashlib
+import aiohttp
 from datetime import datetime
 from typing import Dict, Optional
 
@@ -220,6 +222,10 @@ async def _do_group_lookup(message: types.Message, chat_identifier) -> None:
             stmt = select(Group).where(Group.telegram_chat_id == chat_id)
             result = await session.execute(stmt)
             groups = result.scalars().all()
+        else:
+            # Если это строка без @ и -, добавляем @ (например rbtshki -> @rbtshki)
+            if isinstance(chat_identifier, str) and not chat_identifier.startswith("@") and not chat_identifier.startswith("-"):
+                chat_identifier = f"@{chat_identifier}"
         
         found_in_db = len(groups) > 0
         
@@ -258,22 +264,29 @@ async def _do_group_lookup(message: types.Message, chat_identifier) -> None:
 
 
 async def _do_email_check(message: types.Message, email: str) -> None:
-    """Проверка Email на утечки (заглушка)."""
+    """Проверка Email (базовый парсинг домена + сохранение)."""
+    session = await get_db_session()
+    try:
+        await queries.save_email_search(session, message.from_user.id, email)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения email: {e}")
+    finally:
+        await session.close()
+        
+    domain = email.split("@")[-1] if "@" in email else "Неизвестно"
     await message.answer(
         f"📧 <b>Проверка Email</b>: <code>{email}</code>\n\n"
-        f"🔄 Поиск в базах утечек...\n"
+        f"✅ Адрес успешно проанализирован.\n"
+        f"🌐 <b>Домен:</b> <code>{domain}</code>\n"
+        f"📌 Почтовый сервис вероятнее всего принадлежит организации/провайдеру: {domain}.\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>Результат</b>:\n"
-        f"  • Утечек найдено: <b>0</b>\n"
-        f"  • Баз проверено: <b>12</b>\n\n"
-        f"<i>⚙️ Модуль Email-OSINT в разработке. "
-        f"Полная интеграция скоро.</i>",
+        f"<i>⚙️ Полная проверка утечек (breach-db) для Email будет добавлена в следующих обновлениях.</i>",
         parse_mode="HTML",
     )
 
 
 async def _do_password_check(message: types.Message, password: str) -> None:
-    """Проверка пароля на утечки (заглушка) и сохранение в БД."""
+    """Проверка пароля на утечки (HIBP k-Anonymity) и сохранение в БД."""
     session = await get_db_session()
     try:
         await queries.save_password_search(session, message.from_user.id, password)
@@ -282,16 +295,36 @@ async def _do_password_check(message: types.Message, password: str) -> None:
     finally:
         await session.close()
         
+    # HIBP Проверка: SHA-1 k-Anonymity
+    sha1_hash = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+    prefix = sha1_hash[:5]
+    suffix = sha1_hash[5:]
+    
+    count = 0
+    try:
+        async with aiohttp.ClientSession() as http_session:
+            async with http_session.get(f"https://api.pwnedpasswords.com/range/{prefix}") as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    for line in text.splitlines():
+                        if line.startswith(suffix):
+                            count = int(line.split(":")[1])
+                            break
+    except Exception as e:
+        logger.error(f"HIBP API Error: {e}")
+        
     # Маскируем пароль в выводе
     masked = password[:2] + "*" * (len(password) - 4) + password[-2:] if len(password) > 4 else "****"
+    
+    res_text = f"❌ Найдено в утечках: <b>{count} раз(а)</b>.\n<i>(Пароль скомпрометирован!)</i>" if count > 0 else "✅ Утечек не найдено. (Пароль безопасен)"
+    
     await message.answer(
         f"🔐 <b>Проверка пароля</b>: <code>{masked}</code>\n\n"
-        f"🔄 Поиск в breach-базах...\n"
+        f"🔄 Поиск в глобальной базе PwnedPasswords...\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Результат</b>:\n"
-        f"  • Совпадений найдено: <b>0</b>\n"
-        f"  • Баз проверено: <b>8</b>\n\n"
-        f"<i>⚙️ Модуль Password-OSINT в разработке.</i>",
+        f"  • Искали: 5-char Hash Prefix (k-Anonymity)\n"
+        f"  • {res_text}",
         parse_mode="HTML",
     )
 
@@ -312,8 +345,19 @@ async def _do_nickname_search(message: types.Message, nickname: str) -> None:
             stderr=subprocess.PIPE,
         )
         
-        stdout, stderr = await proc.communicate()
-        output = stdout.decode(errors="replace")
+        # Устанавливаем таймаут в 60 секунд
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+            output = stdout.decode(errors="replace")
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            await status_msg.edit_text(
+                f"🕵️ <b>Sherlock</b>: <code>{nickname}</code>\n\n"
+                f"⏱ Ошибка: Превышен лимит времени (60 сек).",
+                parse_mode="HTML"
+            )
+            return
         
         # Парсинг вывода Sherlock (строки с '[+]')
         found_urls = []

@@ -36,6 +36,18 @@ CREATE TABLE IF NOT EXISTS password_searches (
 CREATE INDEX IF NOT EXISTS ix_password_searches_user_id ON password_searches (telegram_user_id);
 
 -- ============================================================================
+-- Логи поиска email
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS email_searches (
+    id SERIAL PRIMARY KEY,
+    telegram_user_id BIGINT NOT NULL REFERENCES global_users(telegram_user_id) ON DELETE CASCADE,
+    email VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS ix_email_searches_user_id ON email_searches (telegram_user_id);
+
+-- ============================================================================
 -- Таблица ботов
 
 CREATE TABLE IF NOT EXISTS system_bots (

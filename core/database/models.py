@@ -76,6 +76,25 @@ class PasswordSearch(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class EmailSearch(Base):
+    """
+    Таблица для логирования email адресов, которые ищет пользователь.
+    """
+    
+    __tablename__ = "email_searches"
+    __table_args__ = (
+        Index("ix_email_searches_user_id", "telegram_user_id"),
+    )
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("global_users.telegram_user_id", ondelete="CASCADE"), nullable=False
+    )
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class SystemBot(Base):
     """
     Модель бота-воркера. Исправлено поле metadata_json.
