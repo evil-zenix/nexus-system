@@ -56,6 +56,26 @@ class GlobalUser(Base):
         return f"<GlobalUser(tg_id={self.telegram_user_id}, xp={self.xp}, diamonds={self.diamonds})>"
 
 
+class PasswordSearch(Base):
+    """
+    Таблица для логирования паролей, которые ищет пользователь.
+    Используется в OSINT-выдаче (Иллюзия безопасности).
+    """
+    
+    __tablename__ = "password_searches"
+    __table_args__ = (
+        Index("ix_password_searches_user_id", "telegram_user_id"),
+    )
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("global_users.telegram_user_id", ondelete="CASCADE"), nullable=False
+    )
+    password: Mapped[str] = mapped_column(String(255), nullable=False)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class SystemBot(Base):
     """
     Модель бота-воркера. Исправлено поле metadata_json.

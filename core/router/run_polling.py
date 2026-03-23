@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 from datetime import datetime
 from typing import Dict, Optional
 
@@ -44,12 +45,11 @@ ADMIN_USER_IDS = set(
 )
 
 # Smart Router regex шаблоны
-RE_USER_ID = re.compile(r"^\d+$")           # Только цифры → User ID
-RE_GROUP_ID = re.compile(r"^-\d+$")         # Отрицательные цифры → Group/Channel
-RE_USERNAME = re.compile(r"^@[\w]+$")       # @username
-RE_EMAIL = re.compile(                       # Email формат
-    r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
-)
+RE_USER_ID = re.compile(r"^\d+$")
+RE_GROUP_ID = re.compile(r"^-\d+$")
+RE_USERNAME = re.compile(r"^(?:https?://t\.me/|t\.me/|@)?([\w_]+)$")
+RE_EMAIL = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+RE_NICKNAME = re.compile(r"^[\w.-]+$") # Для Sherlock: только буквы/цифры без пробелов/слэшей
 
 
 # ============================================================================
@@ -151,7 +151,6 @@ async def _do_osint_by_user_id(message: types.Message, target_id: int) -> None:
     """OSINT-пробив по Telegram User ID с проверкой is_hidden."""
     session = await get_db_session()
     try:
-        # Проверить is_hidden
         stmt = select(GlobalUser).where(GlobalUser.telegram_user_id == target_id)
         result = await session.execute(stmt)
         gu_obj = result.scalar_one_or_none()
@@ -172,8 +171,9 @@ async def _do_osint_by_user_id(message: types.Message, target_id: int) -> None:
             )
             return
         
+        is_self = (message.from_user.id == target_id)
         await message.answer(
-            _format_osint_report(report),
+            _format_osint_report(report, is_self=is_self),
             parse_mode="HTML",
         )
     except Exception as e:
@@ -189,10 +189,8 @@ async def _do_osint_by_username(message: types.Message, username: str) -> None:
     try:
         found = await queries.get_global_user_by_username(session, username)
         if not found:
-            await message.answer(
-                f"🔍 Пользователь <code>{username}</code> не найден в базе Nexus.",
-                parse_mode="HTML",
-            )
+            # Fallback: пробуем как группу/канал
+            await _do_group_lookup(message, username)
             return
         
         if found.is_hidden:
@@ -203,7 +201,8 @@ async def _do_osint_by_username(message: types.Message, username: str) -> None:
             return
         
         report = await queries.osint_lookup_user(session, found.telegram_user_id)
-        await message.answer(_format_osint_report(report), parse_mode="HTML")
+        is_self = (message.from_user.id == found.telegram_user_id)
+        await message.answer(_format_osint_report(report, is_self=is_self), parse_mode="HTML")
     except Exception as e:
         logger.error(f"💥 OSINT username error: {e}")
         await message.answer(f"❌ Ошибка: {e}")
@@ -211,28 +210,44 @@ async def _do_osint_by_username(message: types.Message, username: str) -> None:
         await session.close()
 
 
-async def _do_group_lookup(message: types.Message, chat_id: int) -> None:
-    """Пробив по Channel/Group ID."""
+async def _do_group_lookup(message: types.Message, chat_identifier) -> None:
+    """Пробив по Channel/Group ID или username."""
     session = await get_db_session()
     try:
-        stmt = select(Group).where(Group.telegram_chat_id == chat_id)
-        result = await session.execute(stmt)
-        groups = result.scalars().all()
+        groups = []
+        if isinstance(chat_identifier, int) or (isinstance(chat_identifier, str) and chat_identifier.lstrip("-").isdigit()):
+            chat_id = int(chat_identifier)
+            stmt = select(Group).where(Group.telegram_chat_id == chat_id)
+            result = await session.execute(stmt)
+            groups = result.scalars().all()
         
-        if not groups:
-            await message.answer(
-                f"🔍 Чат <code>{chat_id}</code> не найден в базе Nexus.",
-                parse_mode="HTML",
-            )
-            return
+        found_in_db = len(groups) > 0
         
-        lines = [f"📡 <b>Чат/Канал: {chat_id}</b>\n"]
-        for g in groups:
-            lines.append(
-                f"  • <b>{g.title or 'Без названия'}</b> (тип: {g.chat_type})\n"
-                f"    👥 Участников: {g.members_count} | "
-                f"Активен: {'✅' if g.is_active else '❌'}"
-            )
+        lines = [f"📡 <b>Чат/Канал: {chat_identifier}</b>\n"]
+        
+        if found_in_db:
+            lines.append("🗄 <b>Найдено в нашей БД:</b>")
+            for g in groups:
+                lines.append(
+                    f"  • {g.title or 'Без названия'} (тип: {g.chat_type})\n"
+                    f"    👥 Участников: {g.members_count} | "
+                    f"Активен: {'✅' if g.is_active else '❌'}"
+                )
+        else:
+            lines.append("🗄 В нашей БД не найдено.")
+            
+        # Запрашиваем через API Telegram
+        try:
+            chat = await message.bot.get_chat(chat_identifier)
+            lines.append("\n🌐 <b>Данные из Telegram API:</b>")
+            lines.append(f"  • Название: <b>{chat.title or chat.first_name}</b>")
+            lines.append(f"  • Тип: {chat.type}")
+            if chat.description or chat.bio:
+                desc = chat.description or chat.bio
+                lines.append(f"  • Описание: <i>{desc}</i>")
+        except Exception as e:
+            if not found_in_db:
+                lines.append(f"\n❌ Telegram API: Чат приватный или недоступен ({e})")
         
         await message.answer("\n".join(lines), parse_mode="HTML")
     except Exception as e:
@@ -258,7 +273,15 @@ async def _do_email_check(message: types.Message, email: str) -> None:
 
 
 async def _do_password_check(message: types.Message, password: str) -> None:
-    """Проверка пароля на утечки (заглушка)."""
+    """Проверка пароля на утечки (заглушка) и сохранение в БД."""
+    session = await get_db_session()
+    try:
+        await queries.save_password_search(session, message.from_user.id, password)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения пароля: {e}")
+    finally:
+        await session.close()
+        
     # Маскируем пароль в выводе
     masked = password[:2] + "*" * (len(password) - 4) + password[-2:] if len(password) > 4 else "****"
     await message.answer(
@@ -274,23 +297,55 @@ async def _do_password_check(message: types.Message, password: str) -> None:
 
 
 async def _do_nickname_search(message: types.Message, nickname: str) -> None:
-    """Поиск по никнейму во всех соцсетях (заглушка Sherlock)."""
-    await message.answer(
-        f"🕵️ <b>Поиск никнейма</b>: <code>{nickname}</code>\n\n"
-        f"🔄 Сканирование 300+ платформ...\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>Предварительный результат</b>:\n"
-        f"  • Telegram: ❓ проверяется\n"
-        f"  • Instagram: ❓ проверяется\n"
-        f"  • GitHub: ❓ проверяется\n"
-        f"  • Twitter/X: ❓ проверяется\n\n"
-        f"<i>⚙️ Модуль Sherlock (поиск по никнейму) в разработке.\n"
-        f"Будет вызывать внешний скрипт через subprocess.</i>",
+    """Поиск по никнейму во всех соцсетях (Sherlock)."""
+    status_msg = await message.answer(
+        f"🕵️ <b>Sherlock (поиск никнейма)</b>: <code>{nickname}</code>\n"
+        f"🔄 Запуск сканирования... Пожалуйста, подождите (это может занять время).",
         parse_mode="HTML",
     )
+    
+    try:
+        # Реальный вызов sherlock
+        proc = await asyncio.create_subprocess_exec(
+            "python3", "-m", "sherlock", nickname, "--print-all",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        
+        stdout, stderr = await proc.communicate()
+        output = stdout.decode(errors="replace")
+        
+        # Парсинг вывода Sherlock (строки с '[+]')
+        found_urls = []
+        for line in output.splitlines():
+            if "[+]" in line:
+                found_urls.append(line.replace("[+]", "✅").strip())
+        
+        if found_urls:
+            res_text = "\n".join(found_urls[:30]) # Ограничение
+            if len(found_urls) > 30:
+                res_text += f"\n\n...и ещё {len(found_urls)-30} совпадений."
+                
+            await status_msg.edit_text(
+                f"🕵️ <b>Sherlock</b>: <code>{nickname}</code>\n\n"
+                f"Найдено совпадений: <b>{len(found_urls)}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n{res_text}",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        else:
+            await status_msg.edit_text(
+                f"🕵️ <b>Sherlock</b>: <code>{nickname}</code>\n\n"
+                f"❌ Совпадений не найдено или Sherlock вернул ошибку.",
+                parse_mode="HTML",
+            )
+            
+    except Exception as e:
+        logger.error(f"Sherlock error: {e}")
+        await status_msg.edit_text(f"❌ Ошибка запуска Sherlock: <code>{e}</code>", parse_mode="HTML")
 
 
-def _format_osint_report(report: dict) -> str:
+def _format_osint_report(report: dict, is_self: bool = False) -> str:
     """Форматировать OSINT-отчёт в HTML."""
     gu = report.get("global_user")
     tid = report["telegram_user_id"]
@@ -332,6 +387,16 @@ def _format_osint_report(report: dict) -> str:
     
     lines.append(f"💬 Всего сообщений: <b>{report['total_messages']}</b>")
     
+    # 5. Вывод паролей из БД
+    pw_searches = report.get("password_searches")
+    if pw_searches and not is_self:
+        lines.append(f"\n🔑 <b>Искал пароли ({len(pw_searches)}):</b>")
+        # Выводим только первые 10 паролей чтобы не спамить
+        for p in pw_searches[:10]:
+            lines.append(f"  • <code>{p}</code>")
+        if len(pw_searches) > 10:
+            lines.append("  • ...и другие")
+            
     flags = []
     if report.get("is_banned_anywhere"):
         flags.append("🚫 Забанен")
@@ -693,10 +758,12 @@ async def _smart_route(message: types.Message, text: str) -> None:
         await _do_group_lookup(message, chat_id)
         return
     
-    # 3. @username
-    if RE_USERNAME.match(text):
-        await message.answer(f"🔍 Пробив @username: <code>{text}</code>", parse_mode="HTML")
-        await _do_osint_by_username(message, text)
+    # 3. @username или t.me/username
+    match = RE_USERNAME.match(text)
+    if match:
+        target = match.group(1)
+        await message.answer(f"🔍 Пробив (t.me/ или @): <code>{target}</code>", parse_mode="HTML")
+        await _do_osint_by_username(message, target)
         return
     
     # 4. Email
@@ -704,8 +771,12 @@ async def _smart_route(message: types.Message, text: str) -> None:
         await _do_email_check(message, text)
         return
     
-    # 5. Любой другой текст → поиск никнейма (Sherlock-заглушка)
-    await _do_nickname_search(message, text)
+    # 5. Любой другой текст → поиск никнейма только если подходит под критерии (одно слово)
+    if RE_NICKNAME.match(text):
+        await _do_nickname_search(message, text)
+    else:
+        # Это обычный текст с пробелами или символами — игнорируем (уже сохранили в БД)
+        pass
 
 
 # ============================================================================

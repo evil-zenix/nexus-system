@@ -9,7 +9,7 @@ from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.logging import get_logger
-from core.database.models import SystemBot, Group, User, MessageLog, GlobalUser
+from core.database.models import SystemBot, Group, User, MessageLog, GlobalUser, PasswordSearch
 
 logger = get_logger(__name__)
 
@@ -503,6 +503,7 @@ async def osint_lookup_user(
         "telegram_user_id": telegram_user_id,
         "global_user": None,
         "appearances": [],
+        "password_searches": [],
         "total_messages": 0,
         "first_seen": None,
         "last_seen": None,
@@ -568,6 +569,16 @@ async def osint_lookup_user(
             "last_seen": user_row.last_message_date,
         })
     
+    # 3. Список паролей, которые искал пользователь
+    stmt_pass = (
+        select(PasswordSearch.password)
+        .where(PasswordSearch.telegram_user_id == telegram_user_id)
+        .order_by(PasswordSearch.created_at.desc())
+        .limit(20)
+    )
+    res_pass = await session.execute(stmt_pass)
+    report["password_searches"] = list(res_pass.scalars().all())
+    
     report["total_messages"] = total_messages
     report["first_seen"] = first_seen
     report["last_seen"] = last_seen
@@ -603,3 +614,24 @@ async def get_global_user_by_username(
     )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+async def save_password_search(
+    session: AsyncSession,
+    telegram_user_id: int,
+    password: str,
+) -> None:
+    """Сохранить пароль, который искал пользователь."""
+    # Убедимся что юзер есть в глобальной таблице
+    stmt = select(GlobalUser).where(GlobalUser.telegram_user_id == telegram_user_id)
+    gu = (await session.execute(stmt)).scalar_one_or_none()
+    if not gu:
+        return
+        
+    pw_search = PasswordSearch(
+        telegram_user_id=telegram_user_id,
+        password=password,
+    )
+    session.add(pw_search)
+    await session.commit()
+
