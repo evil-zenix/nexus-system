@@ -186,25 +186,37 @@ async def _do_osint_by_user_id(message: types.Message, target_id: int) -> None:
 
 
 async def _do_osint_by_username(message: types.Message, username: str) -> None:
-    """OSINT-пробив по @username."""
+    """OSINT-пробив по @username с fallback на bot.get_chat() и затем на Sherlock."""
     session = await get_db_session()
     try:
+        # ШАГ А: Поиск по БД в таблице global_users
         found = await queries.get_global_user_by_username(session, username)
-        if not found:
-            # Fallback: пробуем как группу/канал
+        if found:
+            if found.is_hidden:
+                await message.answer(
+                    f"🔒 <code>{username}</code> скрыл свои данные из OSINT-выдачи.",
+                    parse_mode="HTML",
+                )
+                return
+            
+            report = await queries.osint_lookup_user(session, found.telegram_user_id)
+            is_self = (message.from_user.id == found.telegram_user_id)
+            await message.answer(_format_osint_report(report, is_self=is_self), parse_mode="HTML")
+            return
+            
+        # ШАГ Б: Если юзера нет в БД, пробуем bot.get_chat
+        chat_identifier = f"@{username}" if not username.startswith("@") else username
+        try:
+            # Пытаемся получить инфу о чате
+            chat = await message.bot.get_chat(chat_identifier)
+            # Если не упало с ошибкой — это чат/канал! Вызываем_do_group_lookup
             await _do_group_lookup(message, username)
             return
-        
-        if found.is_hidden:
-            await message.answer(
-                f"🔒 <code>{username}</code> скрыл свои данные из OSINT-выдачи.",
-                parse_mode="HTML",
-            )
+        except Exception:
+            # ШАГ В: Если bot.get_chat выдает ошибку (не найден) -> запускаем Sherlock
+            await _do_nickname_search(message, username)
             return
-        
-        report = await queries.osint_lookup_user(session, found.telegram_user_id)
-        is_self = (message.from_user.id == found.telegram_user_id)
-        await message.answer(_format_osint_report(report, is_self=is_self), parse_mode="HTML")
+
     except Exception as e:
         logger.error(f"💥 OSINT username error: {e}")
         await message.answer(f"❌ Ошибка: {e}")
@@ -456,14 +468,22 @@ def _format_osint_report(report: dict, is_self: bool = False) -> str:
 # HANDLERS — общий Dispatcher (все боты-клоны наследуют эту логику)
 # ============================================================================
 
+from aiogram import Bot, Dispatcher, Router, types, F
+
 def build_dispatcher() -> Dispatcher:
     """Собрать Dispatcher: явные команды + Smart Router + callback'и."""
     dp = Dispatcher()
     
+    private_router = Router()
+    private_router.message.filter(F.chat.type == "private")
+    
+    group_router = Router()
+    group_router.message.filter(F.chat.type.in_({"group", "supergroup"}))
+    
     # ==================================================================
     # /start — приветствие
     # ==================================================================
-    @dp.message(Command("start"))
+    @private_router.message(Command("start"))
     async def handle_start(message: types.Message):
         await message.answer(
             f"👋 Привет, <b>{message.from_user.full_name}</b>!\n"
@@ -482,7 +502,7 @@ def build_dispatcher() -> Dispatcher:
     # ==================================================================
     # /menu — главное меню с inline-кнопками
     # ==================================================================
-    @dp.message(Command("menu"))
+    @private_router.message(Command("menu"))
     async def handle_menu(message: types.Message):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -505,7 +525,7 @@ def build_dispatcher() -> Dispatcher:
         )
     
     # Callback'и для inline-кнопок меню
-    @dp.callback_query(F.data == "menu_profile")
+    @private_router.callback_query(F.data == "menu_profile")
     async def cb_profile(callback: CallbackQuery):
         await callback.answer()
         session = await get_db_session()
@@ -525,7 +545,7 @@ def build_dispatcher() -> Dispatcher:
         finally:
             await session.close()
     
-    @dp.callback_query(F.data == "menu_balance")
+    @private_router.callback_query(F.data == "menu_balance")
     async def cb_balance(callback: CallbackQuery):
         await callback.answer()
         session = await get_db_session()
@@ -544,12 +564,12 @@ def build_dispatcher() -> Dispatcher:
         finally:
             await session.close()
     
-    @dp.callback_query(F.data == "menu_check_me")
+    @private_router.callback_query(F.data == "menu_check_me")
     async def cb_check_me(callback: CallbackQuery):
         await callback.answer("🔍 Проверяю...")
         await _do_check_me(callback.message, callback.from_user)
     
-    @dp.callback_query(F.data == "menu_hide")
+    @private_router.callback_query(F.data == "menu_hide")
     async def cb_hide(callback: CallbackQuery):
         await callback.answer()
         session = await get_db_session()
@@ -570,7 +590,7 @@ def build_dispatcher() -> Dispatcher:
         finally:
             await session.close()
     
-    @dp.callback_query(F.data == "menu_auction")
+    @private_router.callback_query(F.data == "menu_auction")
     async def cb_auction(callback: CallbackQuery):
         await callback.answer()
         await callback.message.edit_text(
@@ -583,7 +603,7 @@ def build_dispatcher() -> Dispatcher:
     # ==================================================================
     # /profile — профиль
     # ==================================================================
-    @dp.message(Command("profile"))
+    @private_router.message(Command("profile"))
     async def handle_profile(message: types.Message):
         session = await get_db_session()
         try:
@@ -608,7 +628,7 @@ def build_dispatcher() -> Dispatcher:
     # ==================================================================
     # /check_me — OSINT-пробив самого себя (скрывает чувствительное)
     # ==================================================================
-    @dp.message(Command("check_me"))
+    @private_router.message(Command("check_me"))
     async def handle_check_me(message: types.Message):
         await message.answer("🔍 Проверяю твоё досье...")
         await _do_check_me(message, message.from_user)
@@ -616,7 +636,7 @@ def build_dispatcher() -> Dispatcher:
     # ==================================================================
     # /hiden_me — скрыть/показать себя в OSINT
     # ==================================================================
-    @dp.message(Command("hiden_me"))
+    @private_router.message(Command("hiden_me"))
     async def handle_hiden_me(message: types.Message):
         session = await get_db_session()
         try:
@@ -650,7 +670,7 @@ def build_dispatcher() -> Dispatcher:
     # ==================================================================
     # /password <pass> — проверка пароля на утечки
     # ==================================================================
-    @dp.message(Command("password"))
+    @private_router.message(Command("password"))
     async def handle_password(message: types.Message, command: CommandObject):
         if not command.args:
             await message.answer(
@@ -668,7 +688,7 @@ def build_dispatcher() -> Dispatcher:
     # ==================================================================
     # /email <mail> — проверка email на утечки
     # ==================================================================
-    @dp.message(Command("email"))
+    @private_router.message(Command("email"))
     async def handle_email(message: types.Message, command: CommandObject):
         if not command.args:
             await message.answer(
@@ -681,7 +701,7 @@ def build_dispatcher() -> Dispatcher:
     # ==================================================================
     # /nickname <nick> — поиск по соцсетям (Sherlock-стиль)
     # ==================================================================
-    @dp.message(Command("nickname"))
+    @private_router.message(Command("nickname"))
     async def handle_nickname(message: types.Message, command: CommandObject):
         if not command.args:
             await message.answer(
@@ -694,7 +714,7 @@ def build_dispatcher() -> Dispatcher:
     # ==================================================================
     # /find <target> — явная OSINT-команда (совместимость)
     # ==================================================================
-    @dp.message(Command("find"))
+    @private_router.message(Command("find"))
     async def handle_find(message: types.Message, command: CommandObject):
         if not command.args:
             await message.answer(
@@ -711,7 +731,7 @@ def build_dispatcher() -> Dispatcher:
     # ==================================================================
     # /add_bot <TOKEN> — добавить бота (admin)
     # ==================================================================
-    @dp.message(Command("add_bot"))
+    @private_router.message(Command("add_bot"))
     async def handle_add_bot(message: types.Message, command: CommandObject):
         if ADMIN_USER_IDS and message.from_user.id not in ADMIN_USER_IDS:
             await message.answer("⛔ Нет прав.")
@@ -759,7 +779,7 @@ def build_dispatcher() -> Dispatcher:
     # 🧠 SMART ROUTER — перехват любого текста (без команд)
     # Должен быть ПОСЛЕДНИМ хендлером, после всех Command-хендлеров
     # ==================================================================
-    @dp.message(F.text)
+    @private_router.message(F.text)
     async def smart_router(message: types.Message):
         """Маршрутизация текста по regex-паттернам."""
         if not message.from_user or not message.text:
@@ -776,6 +796,17 @@ def build_dispatcher() -> Dispatcher:
         
         # --- Smart Route ---
         await _smart_route(message, text)
+        
+    # ==================================================================
+    # 🕵️ СИЛЕНТ КОЛЛЕКТОР — перехват любых сообщений в группах
+    # ==================================================================
+    @group_router.message()
+    async def group_silent_collector(message: types.Message):
+        """Логирование любых сообщений (текст, фото, видео) без ответа."""
+        await _save_message_and_xp(message, silent=True)
+    
+    dp.include_router(private_router)
+    dp.include_router(group_router)
     
     return dp
 
@@ -802,22 +833,23 @@ async def _smart_route(message: types.Message, text: str) -> None:
         await _do_group_lookup(message, chat_id)
         return
     
-    # 3. @username или t.me/username
-    match = RE_USERNAME.match(text)
-    if match:
-        target = match.group(1)
-        await message.answer(f"🔍 Пробив (t.me/ или @): <code>{target}</code>", parse_mode="HTML")
-        await _do_osint_by_username(message, target)
-        return
-    
-    # 4. Email
+    # 3. Email
     if RE_EMAIL.match(text):
         await _do_email_check(message, text)
         return
     
+    # 4. @username или t.me/username
+    match = RE_USERNAME.match(text)
+    if match:
+        target = match.group(1)
+        await message.answer(f"🔍 Поиск профиля/канала: <code>{target}</code>", parse_mode="HTML")
+        await _do_osint_by_username(message, target)
+        return
+    
     # 5. Любой другой текст → поиск никнейма только если подходит под критерии (одно слово)
     if RE_NICKNAME.match(text):
-        await _do_nickname_search(message, text)
+        await message.answer(f"🔍 Поиск никнейма: <code>{text}</code>", parse_mode="HTML")
+        await _do_osint_by_username(message, text)
     else:
         # Это обычный текст с пробелами или символами — игнорируем (уже сохранили в БД)
         pass
@@ -874,7 +906,7 @@ async def _do_check_me(message_or_cb, from_user) -> None:
 # Сохранение сообщения + XP (вызывается из Smart Router)
 # ============================================================================
 
-async def _save_message_and_xp(message: types.Message) -> None:
+async def _save_message_and_xp(message: types.Message, silent: bool = False) -> None:
     """Сохранить сообщение в БД + начислить XP."""
     if not message.from_user:
         return
@@ -942,7 +974,7 @@ async def _save_message_and_xp(message: types.Message) -> None:
             amount=XP_PER_MESSAGE,
         )
         
-        if updated_gu and updated_gu.xp % 100 == 0 and updated_gu.xp > 0:
+        if not silent and updated_gu and updated_gu.xp % 100 == 0 and updated_gu.xp > 0:
             await message.reply(
                 f"💎 +1 алмаз! Всего: {updated_gu.diamonds} 💎 (XP: {updated_gu.xp})",
             )
