@@ -46,6 +46,10 @@ class GlobalUser(Base):
     xp: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     balance: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     
+    # Фаза 1: Профили
+    bio: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_premium: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    
     # Флаг скрытия из OSINT-выдачи (услуга /hiden_me)
     is_hidden: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     
@@ -54,6 +58,40 @@ class GlobalUser(Base):
     
     def __repr__(self) -> str:
         return f"<GlobalUser(tg_id={self.telegram_user_id}, xp={self.xp}, diamonds={self.diamonds})>"
+
+
+class UsernameHistory(Base):
+    """Таблица истории изменений юзернеймов."""
+    
+    __tablename__ = "username_history"
+    __table_args__ = (
+        Index("ix_username_history_user_id", "telegram_user_id"),
+    )
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("global_users.telegram_user_id", ondelete="CASCADE"), nullable=False
+    )
+    username: Mapped[str] = mapped_column(String(255), nullable=False)
+    detected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class NameHistory(Base):
+    """Таблица истории изменений имени."""
+    
+    __tablename__ = "name_history"
+    __table_args__ = (
+        Index("ix_name_history_user_id", "telegram_user_id"),
+    )
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("global_users.telegram_user_id", ondelete="CASCADE"), nullable=False
+    )
+    first_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    last_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    full_name: Mapped[Optional[str]] = mapped_column(String(511), nullable=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class PasswordSearch(Base):

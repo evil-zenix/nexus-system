@@ -13,6 +13,10 @@ CREATE TABLE IF NOT EXISTS global_users (
     xp              INTEGER     NOT NULL DEFAULT 0,
     balance         FLOAT       NOT NULL DEFAULT 0.0,
     
+    -- Фаза 1 Профили
+    bio             TEXT,
+    is_premium      BOOLEAN     NOT NULL DEFAULT FALSE,
+    
     -- Скрытие из OSINT-выдачи
     is_hidden       BOOLEAN     NOT NULL DEFAULT FALSE,
     
@@ -34,6 +38,32 @@ CREATE TABLE IF NOT EXISTS password_searches (
 );
 
 CREATE INDEX IF NOT EXISTS ix_password_searches_user_id ON password_searches (telegram_user_id);
+
+-- ============================================================================
+-- История изменения Username
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS username_history (
+    id SERIAL PRIMARY KEY,
+    telegram_user_id BIGINT NOT NULL REFERENCES global_users(telegram_user_id) ON DELETE CASCADE,
+    username VARCHAR(255) NOT NULL,
+    detected_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS ix_username_history_user_id ON username_history (telegram_user_id);
+
+-- ============================================================================
+-- История изменения Имени
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS name_history (
+    id SERIAL PRIMARY KEY,
+    telegram_user_id BIGINT NOT NULL REFERENCES global_users(telegram_user_id) ON DELETE CASCADE,
+    first_name VARCHAR(255),
+    last_name VARCHAR(255),
+    full_name VARCHAR(511),
+    detected_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS ix_name_history_user_id ON name_history (telegram_user_id);
 
 -- ============================================================================
 -- Логи поиска email

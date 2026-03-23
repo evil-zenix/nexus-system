@@ -9,7 +9,10 @@ from sqlalchemy import select, update, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.logging import get_logger
-from core.database.models import SystemBot, Group, User, MessageLog, GlobalUser, PasswordSearch, EmailSearch
+from core.database.models import (
+    SystemBot, Group, User, MessageLog, GlobalUser, 
+    PasswordSearch, EmailSearch, UsernameHistory, NameHistory
+)
 
 logger = get_logger(__name__)
 
@@ -382,26 +385,42 @@ async def get_or_create_global_user(
     telegram_user_id: int,
     username: Optional[str] = None,
     full_name: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
 ) -> GlobalUser:
     """
     Получить или создать глобальный профиль пользователя.
     
     Используется при каждом сообщении для обновления кэша имени
-    и инициализации экономического профиля.
+    и инициализации экономического профиля. Трекает историю имен.
     """
     stmt = select(GlobalUser).where(GlobalUser.telegram_user_id == telegram_user_id)
     result = await session.execute(stmt)
     global_user = result.scalar_one_or_none()
     
     if global_user:
-        # Обновить кэшированные данные если изменились
         changed = False
+        
+        # Трекаем смену юзернейма
         if username and global_user.username != username:
+            if global_user.username: # Если был старый, сохраняем в историю
+                uh = UsernameHistory(telegram_user_id=telegram_user_id, username=global_user.username)
+                session.add(uh)
             global_user.username = username
             changed = True
+            
+        # Трекаем смену имени
         if full_name and global_user.full_name != full_name:
+            if global_user.full_name: # Был старый
+                nh = NameHistory(
+                    telegram_user_id=telegram_user_id, 
+                    full_name=global_user.full_name,
+                    # We don't have old first/last in GlobalUser, so we just save old full_name
+                )
+                session.add(nh)
             global_user.full_name = full_name
             changed = True
+            
         if changed:
             global_user.updated_at = datetime.utcnow()
             await session.commit()
@@ -425,6 +444,29 @@ async def get_or_create_global_user(
         username=username,
     )
     return global_user
+
+
+async def get_user_history(session: AsyncSession, telegram_user_id: int) -> tuple[List[UsernameHistory], List[NameHistory]]:
+    """Получить историю юзернеймов и имён пользователя (последние 5)."""
+    stmt_un = (
+        select(UsernameHistory)
+        .where(UsernameHistory.telegram_user_id == telegram_user_id)
+        .order_by(UsernameHistory.detected_at.desc())
+        .limit(5)
+    )
+    result_un = await session.execute(stmt_un)
+    un_history = list(result_un.scalars().all())
+    
+    stmt_name = (
+        select(NameHistory)
+        .where(NameHistory.telegram_user_id == telegram_user_id)
+        .order_by(NameHistory.detected_at.desc())
+        .limit(5)
+    )
+    result_name = await session.execute(stmt_name)
+    name_history = list(result_name.scalars().all())
+    
+    return un_history, name_history
 
 
 async def add_xp(
@@ -523,8 +565,14 @@ async def osint_lookup_user(
             "xp": global_user.xp,
             "diamonds": global_user.diamonds,
             "balance": global_user.balance,
+            "bio": global_user.bio,
+            "is_premium": global_user.is_premium,
             "registered_at": global_user.created_at,
         }
+        
+    un_history, name_history = await get_user_history(session, telegram_user_id)
+    report["username_history"] = un_history
+    report["name_history"] = name_history
     
     # 2. Все записи пользователя по всем группам/ботам
     stmt = (

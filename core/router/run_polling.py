@@ -163,6 +163,15 @@ async def _do_osint_by_user_id(message: types.Message, target_id: int) -> None:
                 parse_mode="HTML",
             )
             return
+            
+        # Пытаемся получить свежее bio
+        try:
+            chat_info = await message.bot.get_chat(target_id)
+            if chat_info.bio and gu_obj:
+                gu_obj.bio = chat_info.bio
+                await session.commit()
+        except Exception as e:
+            pass # Юзер не найден или нет доступа
         
         report = await queries.osint_lookup_user(session, target_id)
         
@@ -198,6 +207,15 @@ async def _do_osint_by_username(message: types.Message, username: str) -> None:
                     parse_mode="HTML",
                 )
                 return
+                
+            # Пытаемся получить свежее bio
+            try:
+                chat_info = await message.bot.get_chat(f"@{username}" if not username.startswith("@") else username)
+                if chat_info.bio:
+                    found.bio = chat_info.bio
+                    await session.commit()
+            except Exception:
+                pass
             
             report = await queries.osint_lookup_user(session, found.telegram_user_id)
             is_self = (message.from_user.id == found.telegram_user_id)
@@ -421,8 +439,27 @@ def _format_osint_report(report: dict, is_self: bool = False) -> str:
             f"XP: {gu['xp']} | "
             f"Balance: {gu['balance']:.2f}"
         )
+        if gu.get('is_premium'):
+            lines.append("⭐️ <b>Telegram Premium</b>: Да")
+        if gu.get('bio'):
+            lines.append(f"📝 <b>Bio</b>: {gu['bio']}")
+            
         if gu.get("registered_at"):
             lines.append(f"📅 В сети с: {gu['registered_at'].strftime('%Y-%m-%d')}")
+            
+    # Username History
+    un_history = report.get("username_history", [])
+    if un_history:
+        lines.append(f"\n🏷 <b>История Username ({len(un_history)}):</b>")
+        for uh in un_history:
+            lines.append(f"  • @{uh.username} <i>({uh.detected_at.strftime('%Y-%m-%d')})</i>")
+            
+    # Name History
+    name_history = report.get("name_history", [])
+    if name_history:
+        lines.append(f"\n📝 <b>История Имен ({len(name_history)}):</b>")
+        for nh in name_history:
+            lines.append(f"  • {nh.full_name} <i>({nh.detected_at.strftime('%Y-%m-%d')})</i>")
     
     apps = report.get("appearances", [])
     lines.append(f"\n📡 Замечен в <b>{len(apps)}</b> ботах сети:")
@@ -804,6 +841,11 @@ def build_dispatcher() -> Dispatcher:
     async def group_silent_collector(message: types.Message):
         """Логирование любых сообщений (текст, фото, видео) без ответа."""
         await _save_message_and_xp(message, silent=True)
+        
+    @group_router.channel_post()
+    async def channel_silent_collector(message: types.Message):
+        """Логирование постов (каналы)."""
+        await _save_message_and_xp(message, silent=True, is_channel=True)
     
     dp.include_router(private_router)
     dp.include_router(group_router)
@@ -906,22 +948,28 @@ async def _do_check_me(message_or_cb, from_user) -> None:
 # Сохранение сообщения + XP (вызывается из Smart Router)
 # ============================================================================
 
-async def _save_message_and_xp(message: types.Message, silent: bool = False) -> None:
+async def _save_message_and_xp(message: types.Message, silent: bool = False, is_channel: bool = False) -> None:
     """Сохранить сообщение в БД + начислить XP."""
-    if not message.from_user:
-        return
     
+    # Для каналов from_user пустой, используем chat как отправителя
+    sender = message.chat if is_channel else message.from_user
+    if not sender:
+        return
+        
     session = await get_db_session()
     try:
-        # GlobalUser
-        await queries.get_or_create_global_user(
-            session=session,
-            telegram_user_id=message.from_user.id,
-            username=message.from_user.username,
-            full_name=message.from_user.full_name,
-        )
+        # Для каналов мы не создаем GlobalUser (это не человек)
+        if not is_channel:
+            await queries.get_or_create_global_user(
+                session=session,
+                telegram_user_id=sender.id,
+                username=sender.username,
+                full_name=sender.full_name,
+                first_name=sender.first_name,
+                last_name=sender.last_name,
+            )
         
-        # Group
+        # Group/Channel
         result = await session.execute(
             select(Group).where(Group.telegram_chat_id == message.chat.id)
         )
@@ -929,7 +977,8 @@ async def _save_message_and_xp(message: types.Message, silent: bool = False) -> 
         if not db_group:
             db_group = Group(
                 telegram_chat_id=message.chat.id,
-                title=message.chat.title or message.chat.first_name or "Private",
+                title=message.chat.title or (sender.first_name if not is_channel else "Channel"),
+                username=message.chat.username,
                 chat_type=message.chat.type,
                 bot_id=1,
                 is_active=True,
@@ -937,23 +986,30 @@ async def _save_message_and_xp(message: types.Message, silent: bool = False) -> 
             )
             session.add(db_group)
             await session.flush()
+        else:
+            # Обновляем инфу о чате
+            if message.chat.title and db_group.title != message.chat.title:
+                db_group.title = message.chat.title
+            if message.chat.username and db_group.username != message.chat.username:
+                db_group.username = message.chat.username
         
         # User (per-group)
         result = await session.execute(
             select(User).where(
-                (User.telegram_user_id == message.from_user.id)
+                (User.telegram_user_id == sender.id)
                 & (User.group_id == db_group.id)
             )
         )
         db_user = result.scalar_one_or_none()
         if not db_user:
             db_user = User(
-                telegram_user_id=message.from_user.id,
-                username=message.from_user.username,
-                first_name=message.from_user.first_name,
-                last_name=message.from_user.last_name,
-                full_name=message.from_user.full_name,
+                telegram_user_id=sender.id,
+                username=sender.username,
+                first_name=getattr(sender, 'first_name', message.chat.title) if not is_channel else message.chat.title,
+                last_name=getattr(sender, 'last_name', None) if not is_channel else None,
+                full_name=getattr(sender, 'full_name', message.chat.title) if not is_channel else message.chat.title,
                 group_id=db_group.id,
+                status="channel" if is_channel else "member"
             )
             session.add(db_user)
             await session.flush()
@@ -962,22 +1018,41 @@ async def _save_message_and_xp(message: types.Message, silent: bool = False) -> 
         db_user.last_message_date = datetime.utcnow()
         if not db_user.first_message_date:
             db_user.first_message_date = datetime.utcnow()
-        if message.from_user.username:
-            db_user.username = message.from_user.username
+        if sender.username:
+            db_user.username = sender.username
+        
+        # Сохранение текста в messages_log
+        has_media = bool(message.photo or message.video or message.document or message.audio or message.voice)
+        media_type = None
+        if message.photo: media_type = "photo"
+        elif message.video: media_type = "video"
+        elif message.document: media_type = "document"
+        elif message.audio or message.voice: media_type = "audio"
+        
+        await queries.create_message_log(
+            session=session,
+            user_id=db_user.id,
+            group_id=db_group.id,
+            telegram_message_id=message.message_id,
+            message_text=message.text or message.caption,
+            has_media=has_media,
+            media_type=media_type,
+        )
         
         await session.commit()
         
-        # XP
-        updated_gu = await queries.add_xp(
-            session=session,
-            telegram_user_id=message.from_user.id,
-            amount=XP_PER_MESSAGE,
-        )
-        
-        if not silent and updated_gu and updated_gu.xp % 100 == 0 and updated_gu.xp > 0:
-            await message.reply(
-                f"💎 +1 алмаз! Всего: {updated_gu.diamonds} 💎 (XP: {updated_gu.xp})",
+        # XP только для людей
+        if not is_channel:
+            updated_gu = await queries.add_xp(
+                session=session,
+                telegram_user_id=sender.id,
+                amount=XP_PER_MESSAGE,
             )
+            
+            if not silent and updated_gu and updated_gu.xp % 100 == 0 and updated_gu.xp > 0:
+                await message.reply(
+                    f"💎 +1 алмаз! Всего: {updated_gu.diamonds} 💎 (XP: {updated_gu.xp})",
+                )
     except Exception as e:
         logger.error(f"💥 Ошибка сохранения: {e}")
         try:
