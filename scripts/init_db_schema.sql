@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS global_users (
     xp              INTEGER     NOT NULL DEFAULT 0,
     balance         FLOAT       NOT NULL DEFAULT 0.0,
     
+    -- Скрытие из OSINT-выдачи
+    is_hidden       BOOLEAN     NOT NULL DEFAULT FALSE,
+    
     created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );

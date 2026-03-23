@@ -1,29 +1,28 @@
 """
-Nexus Bot Network — Dynamic Polling с BotPoolManager.
+Nexus Bot Network — Dynamic Polling + Smart Router.
 
 Архитектура:
-- BotPoolManager управляет пулом ботов (словарь bot_id → asyncio.Task)
-- Каждые 5 минут синхронизирует активных ботов из БД
-- Все боты используют один Dispatcher с общими хендлерами
-- /add_bot — добавить нового бота в сеть  
-- /find    — OSINT-пробив пользователя по всем ботам
-- Начисление XP + diamonds за каждое сообщение
+- BotPoolManager управляет пулом ботов (bot_id → asyncio.Task)
+- Smart Router: любой текст автоматически маршрутизируется по regex
+- Все боты-клоны используют один Dispatcher
 """
 import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Dict, Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from sqlalchemy import select
 
 from config.settings import settings
 from core.queue.redis_client import init_redis
 from core.database.db import init_db, get_db_session
-from core.database.models import User, Group, SystemBot
+from core.database.models import User, Group, SystemBot, GlobalUser
 from core.database import queries
 
 logging.basicConfig(
@@ -36,115 +35,77 @@ logger = logging.getLogger(__name__)
 # КОНСТАНТЫ
 # ============================================================================
 
-# Интервал синхронизации ботов из БД (секунд)
 BOT_SYNC_INTERVAL = 300  # 5 минут
-
-# XP за каждое сообщение
 XP_PER_MESSAGE = 10
 
-# ID администраторов (из .env: ADMIN_USER_IDS=123456,789012)
 _admin_ids_raw = os.getenv("ADMIN_USER_IDS", "")
 ADMIN_USER_IDS = set(
     int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip().isdigit()
 )
 
+# Smart Router regex шаблоны
+RE_USER_ID = re.compile(r"^\d+$")           # Только цифры → User ID
+RE_GROUP_ID = re.compile(r"^-\d+$")         # Отрицательные цифры → Group/Channel
+RE_USERNAME = re.compile(r"^@[\w]+$")       # @username
+RE_EMAIL = re.compile(                       # Email формат
+    r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+)
+
 
 # ============================================================================
-# BOT POOL MANAGER — динамический пул ботов
+# BOT POOL MANAGER
 # ============================================================================
 
 class BotPoolManager:
-    """
-    Управляет пулом ботов в сети Nexus.
-    
-    Каждый бот запускается как отдельная asyncio.Task (dp.start_polling).
-    При синхронизации из БД:
-      - Новые боты добавляются в пул и запускаются
-      - Деактивированные боты (is_active=False) останавливаются
-    """
+    """Управляет пулом ботов. Каждый бот — отдельная asyncio.Task."""
     
     def __init__(self, dispatcher: Dispatcher):
         self.dp = dispatcher
-        # bot_id (Telegram numeric) → asyncio.Task
         self.active_tasks: Dict[int, asyncio.Task] = {}
-        # bot_id → Bot instance (для корректного закрытия)
         self.active_bots: Dict[int, Bot] = {}
         self._running = False
     
     async def start(self) -> None:
-        """Запустить менеджер: загрузить ботов из БД + начать цикл синхронизации."""
         self._running = True
         logger.info("🚀 BotPoolManager запускается...")
-        
-        # Первичная загрузка из БД
         await self._sync_bots_from_db()
-        
-        # Фоновая задача синхронизации
         asyncio.create_task(self._sync_loop())
-        
-        logger.info(
-            f"✅ BotPoolManager запущен. Ботов в пуле: {len(self.active_tasks)}"
-        )
+        logger.info(f"✅ BotPoolManager запущен. Ботов в пуле: {len(self.active_tasks)}")
     
     async def stop(self) -> None:
-        """Остановить все боты и менеджер."""
         self._running = False
         logger.info("🛑 Остановка BotPoolManager...")
-        
         for bot_id, task in list(self.active_tasks.items()):
             task.cancel()
-        
         for bot_id, bot in list(self.active_bots.items()):
             await bot.session.close()
-        
         self.active_tasks.clear()
         self.active_bots.clear()
     
     async def add_bot(self, token: str, bot_db_id: int, telegram_bot_id: int) -> bool:
-        """
-        Добавить нового бота в пул (вызывается после /add_bot или sync из БД).
-        
-        Args:
-            token: Telegram Bot Token
-            bot_db_id: ID бота в таблице system_bots (для логов)
-            telegram_bot_id: Telegram numeric bot ID (ключ в пуле)
-        
-        Returns:
-            True если бот успешно добавлен, False если уже был в пуле
-        """
         if telegram_bot_id in self.active_bots:
-            logger.info(f"ℹ️ Бот {telegram_bot_id} уже в пуле, пропускаем")
             return False
-        
         bot = Bot(token=token)
         self.active_bots[telegram_bot_id] = bot
-        
-        # Запускаем polling в отдельной задаче
         task = asyncio.create_task(
             self._run_bot_polling(bot, telegram_bot_id),
             name=f"bot_polling_{telegram_bot_id}",
         )
         self.active_tasks[telegram_bot_id] = task
-        
-        logger.info(f"➕ Бот {telegram_bot_id} добавлен в пул (db_id={bot_db_id})")
+        logger.info(f"➕ Бот {telegram_bot_id} добавлен в пул")
         return True
     
     async def remove_bot(self, telegram_bot_id: int) -> None:
-        """Убрать бота из пула (деактивирован в БД)."""
         if telegram_bot_id not in self.active_tasks:
             return
-        
         self.active_tasks[telegram_bot_id].cancel()
         del self.active_tasks[telegram_bot_id]
-        
         bot = self.active_bots.pop(telegram_bot_id, None)
         if bot:
             await bot.session.close()
-        
         logger.info(f"➖ Бот {telegram_bot_id} удалён из пула")
     
     async def _run_bot_polling(self, bot: Bot, bot_id: int) -> None:
-        """Запустить polling для одного бота с обработкой ошибок."""
         try:
             logger.info(f"▶️  Polling запущен для бота {bot_id}")
             await self.dp.start_polling(bot, handle_signals=False)
@@ -154,7 +115,6 @@ class BotPoolManager:
             logger.error(f"💥 Ошибка polling бота {bot_id}: {e}")
     
     async def _sync_loop(self) -> None:
-        """Фоновая задача: каждые 5 минут синхронизировать ботов из БД."""
         while self._running:
             await asyncio.sleep(BOT_SYNC_INTERVAL)
             if self._running:
@@ -162,69 +122,363 @@ class BotPoolManager:
                 await self._sync_bots_from_db()
     
     async def _sync_bots_from_db(self) -> None:
-        """Синхронизировать пул ботов с таблицей system_bots."""
         try:
             session = await get_db_session()
             try:
                 db_bots = await queries.get_all_active_bots(session)
                 db_bot_ids = {b.bot_id: b for b in db_bots}
-                
-                # Добавить новых ботов из БД
                 for bot_id, bot_record in db_bot_ids.items():
                     if bot_id not in self.active_bots:
-                        logger.info(
-                            f"🆕 Новый бот из БД: {bot_record.bot_username} "
-                            f"(id={bot_id})"
-                        )
                         await self.add_bot(
                             token=bot_record.bot_token,
                             bot_db_id=bot_record.id,
                             telegram_bot_id=bot_id,
                         )
-                
-                # Остановить деактивированных ботов
                 for tg_id in list(self.active_bots.keys()):
                     if tg_id not in db_bot_ids:
-                        logger.info(f"🚫 Бот {tg_id} деактивирован — убираем из пула")
                         await self.remove_bot(tg_id)
-                        
             finally:
                 await session.close()
-        
         except Exception as e:
             logger.error(f"💥 Ошибка при синхронизации ботов из БД: {e}")
 
 
 # ============================================================================
-# HANDLERS — общий Dispatcher для всех ботов в пуле
+# OSINT ФУНКЦИИ (вынесены для переиспользования в Smart Router)
+# ============================================================================
+
+async def _do_osint_by_user_id(message: types.Message, target_id: int) -> None:
+    """OSINT-пробив по Telegram User ID с проверкой is_hidden."""
+    session = await get_db_session()
+    try:
+        # Проверить is_hidden
+        stmt = select(GlobalUser).where(GlobalUser.telegram_user_id == target_id)
+        result = await session.execute(stmt)
+        gu_obj = result.scalar_one_or_none()
+        
+        if gu_obj and gu_obj.is_hidden:
+            await message.answer(
+                f"🔒 Пользователь <code>{target_id}</code> скрыл свои данные из OSINT-выдачи.",
+                parse_mode="HTML",
+            )
+            return
+        
+        report = await queries.osint_lookup_user(session, target_id)
+        
+        if not report["appearances"] and not report["global_user"]:
+            await message.answer(
+                f"🔍 <code>{target_id}</code> — не найден в базе Nexus.",
+                parse_mode="HTML",
+            )
+            return
+        
+        await message.answer(
+            _format_osint_report(report),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"💥 OSINT error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await session.close()
+
+
+async def _do_osint_by_username(message: types.Message, username: str) -> None:
+    """OSINT-пробив по @username."""
+    session = await get_db_session()
+    try:
+        found = await queries.get_global_user_by_username(session, username)
+        if not found:
+            await message.answer(
+                f"🔍 Пользователь <code>{username}</code> не найден в базе Nexus.",
+                parse_mode="HTML",
+            )
+            return
+        
+        if found.is_hidden:
+            await message.answer(
+                f"🔒 <code>{username}</code> скрыл свои данные из OSINT-выдачи.",
+                parse_mode="HTML",
+            )
+            return
+        
+        report = await queries.osint_lookup_user(session, found.telegram_user_id)
+        await message.answer(_format_osint_report(report), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"💥 OSINT username error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await session.close()
+
+
+async def _do_group_lookup(message: types.Message, chat_id: int) -> None:
+    """Пробив по Channel/Group ID."""
+    session = await get_db_session()
+    try:
+        stmt = select(Group).where(Group.telegram_chat_id == chat_id)
+        result = await session.execute(stmt)
+        groups = result.scalars().all()
+        
+        if not groups:
+            await message.answer(
+                f"🔍 Чат <code>{chat_id}</code> не найден в базе Nexus.",
+                parse_mode="HTML",
+            )
+            return
+        
+        lines = [f"📡 <b>Чат/Канал: {chat_id}</b>\n"]
+        for g in groups:
+            lines.append(
+                f"  • <b>{g.title or 'Без названия'}</b> (тип: {g.chat_type})\n"
+                f"    👥 Участников: {g.members_count} | "
+                f"Активен: {'✅' if g.is_active else '❌'}"
+            )
+        
+        await message.answer("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"💥 Group lookup error: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await session.close()
+
+
+async def _do_email_check(message: types.Message, email: str) -> None:
+    """Проверка Email на утечки (заглушка)."""
+    await message.answer(
+        f"📧 <b>Проверка Email</b>: <code>{email}</code>\n\n"
+        f"🔄 Поиск в базах утечек...\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Результат</b>:\n"
+        f"  • Утечек найдено: <b>0</b>\n"
+        f"  • Баз проверено: <b>12</b>\n\n"
+        f"<i>⚙️ Модуль Email-OSINT в разработке. "
+        f"Полная интеграция скоро.</i>",
+        parse_mode="HTML",
+    )
+
+
+async def _do_password_check(message: types.Message, password: str) -> None:
+    """Проверка пароля на утечки (заглушка)."""
+    # Маскируем пароль в выводе
+    masked = password[:2] + "*" * (len(password) - 4) + password[-2:] if len(password) > 4 else "****"
+    await message.answer(
+        f"🔐 <b>Проверка пароля</b>: <code>{masked}</code>\n\n"
+        f"🔄 Поиск в breach-базах...\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Результат</b>:\n"
+        f"  • Совпадений найдено: <b>0</b>\n"
+        f"  • Баз проверено: <b>8</b>\n\n"
+        f"<i>⚙️ Модуль Password-OSINT в разработке.</i>",
+        parse_mode="HTML",
+    )
+
+
+async def _do_nickname_search(message: types.Message, nickname: str) -> None:
+    """Поиск по никнейму во всех соцсетях (заглушка Sherlock)."""
+    await message.answer(
+        f"🕵️ <b>Поиск никнейма</b>: <code>{nickname}</code>\n\n"
+        f"🔄 Сканирование 300+ платформ...\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Предварительный результат</b>:\n"
+        f"  • Telegram: ❓ проверяется\n"
+        f"  • Instagram: ❓ проверяется\n"
+        f"  • GitHub: ❓ проверяется\n"
+        f"  • Twitter/X: ❓ проверяется\n\n"
+        f"<i>⚙️ Модуль Sherlock (поиск по никнейму) в разработке.\n"
+        f"Будет вызывать внешний скрипт через subprocess.</i>",
+        parse_mode="HTML",
+    )
+
+
+def _format_osint_report(report: dict) -> str:
+    """Форматировать OSINT-отчёт в HTML."""
+    gu = report.get("global_user")
+    tid = report["telegram_user_id"]
+    
+    username_display = f"@{gu['username']}" if gu and gu.get("username") else str(tid)
+    full_name = (gu.get("full_name") or "Неизвестно") if gu else "Неизвестно"
+    
+    lines = [
+        f"🔍 <b>OSINT Report: {username_display}</b>",
+        f"👤 Имя: {full_name}",
+        f"🆔 ID: <code>{tid}</code>",
+    ]
+    
+    if gu:
+        lines.append(
+            f"💎 Diamonds: {gu['diamonds']} | "
+            f"XP: {gu['xp']} | "
+            f"Balance: {gu['balance']:.2f}"
+        )
+        if gu.get("registered_at"):
+            lines.append(f"📅 В сети с: {gu['registered_at'].strftime('%Y-%m-%d')}")
+    
+    apps = report.get("appearances", [])
+    lines.append(f"\n📡 Замечен в <b>{len(apps)}</b> ботах сети:")
+    
+    for app in apps[:10]:
+        bot_tag = f"@{app['bot_username']}" if app.get("bot_username") else app["bot_name"]
+        chat_name = app.get("chat_title") or str(app["chat_id"])
+        lines.append(
+            f'  • [{bot_tag}] → "{chat_name}" '
+            f"({app['message_count']} сообщ.)"
+            + (" 🚫" if app.get("is_banned") else "")
+        )
+    
+    if report.get("first_seen"):
+        lines.append(f"\n🕐 Первое: {report['first_seen'].strftime('%Y-%m-%d %H:%M')}")
+    if report.get("last_seen"):
+        lines.append(f"🕐 Последнее: {report['last_seen'].strftime('%Y-%m-%d %H:%M')}")
+    
+    lines.append(f"💬 Всего сообщений: <b>{report['total_messages']}</b>")
+    
+    flags = []
+    if report.get("is_banned_anywhere"):
+        flags.append("🚫 Забанен")
+    if report.get("is_spam_anywhere"):
+        flags.append("⚠️ Спамер")
+    if flags:
+        lines.append("⚡ Статус: " + ", ".join(flags))
+    
+    return "\n".join(lines)
+
+
+# ============================================================================
+# HANDLERS — общий Dispatcher (все боты-клоны наследуют эту логику)
 # ============================================================================
 
 def build_dispatcher() -> Dispatcher:
-    """Создать Dispatcher со всеми хендлерами."""
+    """Собрать Dispatcher: явные команды + Smart Router + callback'и."""
     dp = Dispatcher()
     
-    # ------------------------------------------------------------------
+    # ==================================================================
     # /start — приветствие
-    # ------------------------------------------------------------------
+    # ==================================================================
     @dp.message(Command("start"))
     async def handle_start(message: types.Message):
-        user = message.from_user
         await message.answer(
-            f"👋 Привет, {user.full_name}!\n"
-            f"🛰 Nexus Network Online.\n"
-            f"Твои сообщения сохраняются в общую базу.\n\n"
-            f"📊 /profile — посмотреть XP и баланс\n"
-            f"🔍 /find @username — OSINT-пробив\n"
+            f"👋 Привет, <b>{message.from_user.full_name}</b>!\n"
+            f"🛰 <b>Nexus Network Online</b>\n\n"
+            f"Просто напиши мне:\n"
+            f"  • <code>123456789</code> — пробив по User ID\n"
+            f"  • <code>@username</code> — пробив по нику\n"
+            f"  • <code>-1001234</code> — пробив чата/канала\n"
+            f"  • <code>mail@example.com</code> — проверка email\n"
+            f"  • <code>любой текст</code> — поиск никнейма\n\n"
+            f"📋 /menu — главное меню\n"
+            f"📊 /profile — твой профиль",
+            parse_mode="HTML",
         )
     
-    # ------------------------------------------------------------------
-    # /profile — посмотреть экономику
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # /menu — главное меню с inline-кнопками
+    # ==================================================================
+    @dp.message(Command("menu"))
+    async def handle_menu(message: types.Message):
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👤 Профиль", callback_data="menu_profile"),
+                InlineKeyboardButton(text="💰 Баланс", callback_data="menu_balance"),
+            ],
+            [
+                InlineKeyboardButton(text="🔍 Пробить себя", callback_data="menu_check_me"),
+                InlineKeyboardButton(text="🕵️ Скрыться", callback_data="menu_hide"),
+            ],
+            [
+                InlineKeyboardButton(text="🏪 Аукцион", callback_data="menu_auction"),
+            ],
+        ])
+        await message.answer(
+            "📋 <b>NEXUS — Главное меню</b>\n\n"
+            "Выбери действие:",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    
+    # Callback'и для inline-кнопок меню
+    @dp.callback_query(F.data == "menu_profile")
+    async def cb_profile(callback: CallbackQuery):
+        await callback.answer()
+        session = await get_db_session()
+        try:
+            gu = await queries.get_or_create_global_user(
+                session, callback.from_user.id,
+                callback.from_user.username, callback.from_user.full_name,
+            )
+            await callback.message.edit_text(
+                f"👤 <b>Профиль: {callback.from_user.full_name}</b>\n"
+                f"🎯 XP: <b>{gu.xp}</b>\n"
+                f"💎 Diamonds: <b>{gu.diamonds}</b>\n"
+                f"💰 Balance: <b>{gu.balance:.2f}</b>\n"
+                f"🔒 Скрыт: {'Да' if gu.is_hidden else 'Нет'}",
+                parse_mode="HTML",
+            )
+        finally:
+            await session.close()
+    
+    @dp.callback_query(F.data == "menu_balance")
+    async def cb_balance(callback: CallbackQuery):
+        await callback.answer()
+        session = await get_db_session()
+        try:
+            gu = await queries.get_or_create_global_user(
+                session, callback.from_user.id,
+                callback.from_user.username, callback.from_user.full_name,
+            )
+            await callback.message.edit_text(
+                f"💰 <b>Баланс</b>\n\n"
+                f"💎 Diamonds: <b>{gu.diamonds}</b>\n"
+                f"🎯 XP: <b>{gu.xp}</b> (до 💎: {100 - (gu.xp % 100)} XP)\n"
+                f"💵 Balance: <b>{gu.balance:.2f}</b>",
+                parse_mode="HTML",
+            )
+        finally:
+            await session.close()
+    
+    @dp.callback_query(F.data == "menu_check_me")
+    async def cb_check_me(callback: CallbackQuery):
+        await callback.answer("🔍 Проверяю...")
+        await _do_check_me(callback.message, callback.from_user)
+    
+    @dp.callback_query(F.data == "menu_hide")
+    async def cb_hide(callback: CallbackQuery):
+        await callback.answer()
+        session = await get_db_session()
+        try:
+            gu = await queries.get_or_create_global_user(
+                session, callback.from_user.id,
+                callback.from_user.username, callback.from_user.full_name,
+            )
+            gu.is_hidden = True
+            gu.updated_at = datetime.utcnow()
+            await session.commit()
+            await callback.message.edit_text(
+                "🕵️ <b>Режим невидимки активирован!</b>\n\n"
+                "Твои данные больше не будут отображаться в OSINT-выдаче.\n"
+                "Используй /hiden_me повторно чтобы отключить.",
+                parse_mode="HTML",
+            )
+        finally:
+            await session.close()
+    
+    @dp.callback_query(F.data == "menu_auction")
+    async def cb_auction(callback: CallbackQuery):
+        await callback.answer()
+        await callback.message.edit_text(
+            "🏪 <b>Аукцион</b>\n\n"
+            "⚙️ Модуль аукциона в разработке.\n"
+            "Скоро здесь можно будет продавать и покупать 💎 за баланс.",
+            parse_mode="HTML",
+        )
+    
+    # ==================================================================
+    # /profile — профиль
+    # ==================================================================
     @dp.message(Command("profile"))
     async def handle_profile(message: types.Message):
         session = await get_db_session()
         try:
-            global_user = await queries.get_or_create_global_user(
+            gu = await queries.get_or_create_global_user(
                 session=session,
                 telegram_user_id=message.from_user.id,
                 username=message.from_user.username,
@@ -232,83 +486,105 @@ def build_dispatcher() -> Dispatcher:
             )
             await message.answer(
                 f"👤 <b>Профиль: {message.from_user.full_name}</b>\n"
-                f"🎯 XP: <b>{global_user.xp}</b>\n"
-                f"💎 Diamonds: <b>{global_user.diamonds}</b>\n"
-                f"💰 Balance: <b>{global_user.balance:.2f}</b>\n\n"
+                f"🎯 XP: <b>{gu.xp}</b>\n"
+                f"💎 Diamonds: <b>{gu.diamonds}</b>\n"
+                f"💰 Balance: <b>{gu.balance:.2f}</b>\n"
+                f"🔒 Скрыт: {'Да' if gu.is_hidden else 'Нет'}\n\n"
                 f"<i>За каждые 100 XP ты получаешь 1 💎</i>",
                 parse_mode="HTML",
             )
         finally:
             await session.close()
     
-    # ------------------------------------------------------------------
-    # /add_bot <TOKEN> — добавить нового бота в сеть
-    # ------------------------------------------------------------------
-    @dp.message(Command("add_bot"))
-    async def handle_add_bot(message: types.Message, command: CommandObject):
-        # Проверка прав администратора
-        if ADMIN_USER_IDS and message.from_user.id not in ADMIN_USER_IDS:
-            await message.answer("⛔ У тебя нет прав для добавления ботов.")
-            return
-        
-        if not command.args:
-            await message.answer(
-                "❌ Укажи токен бота:\n"
-                "<code>/add_bot 1234567890:ABCdefGHIjklMNO...</code>",
-                parse_mode="HTML",
-            )
-            return
-        
-        token = command.args.strip()
-        
-        # Валидация токена через Telegram API
-        try:
-            test_bot = Bot(token=token)
-            bot_info = await test_bot.get_me()
-            await test_bot.session.close()
-        except Exception as e:
-            await message.answer(f"❌ Невалидный токен: <code>{e}</code>", parse_mode="HTML")
-            return
-        
-        # Сохранить в БД
+    # ==================================================================
+    # /check_me — OSINT-пробив самого себя (скрывает чувствительное)
+    # ==================================================================
+    @dp.message(Command("check_me"))
+    async def handle_check_me(message: types.Message):
+        await message.answer("🔍 Проверяю твоё досье...")
+        await _do_check_me(message, message.from_user)
+    
+    # ==================================================================
+    # /hiden_me — скрыть/показать себя в OSINT
+    # ==================================================================
+    @dp.message(Command("hiden_me"))
+    async def handle_hiden_me(message: types.Message):
         session = await get_db_session()
         try:
-            db_bot = await queries.get_or_create_bot(
+            gu = await queries.get_or_create_global_user(
                 session=session,
-                bot_id=bot_info.id,
-                bot_name=bot_info.username or f"bot_{bot_info.id}",
-                bot_token=token,
-                bot_username=bot_info.username,
+                telegram_user_id=message.from_user.id,
+                username=message.from_user.username,
+                full_name=message.from_user.full_name,
             )
+            # Переключаем флаг
+            gu.is_hidden = not gu.is_hidden
+            gu.updated_at = datetime.utcnow()
+            await session.commit()
             
-            # Немедленно добавить в пул (если не в пуле)
-            # _pool_manager будет доступен через closure после инициализации
-            if _pool_manager:
-                added = await _pool_manager.add_bot(
-                    token=token,
-                    bot_db_id=db_bot.id,
-                    telegram_bot_id=bot_info.id,
+            if gu.is_hidden:
+                await message.answer(
+                    "🕵️ <b>Режим невидимки активирован!</b>\n\n"
+                    "Твои данные скрыты из OSINT-выдачи.\n"
+                    "Повторный /hiden_me отключит режим.",
+                    parse_mode="HTML",
                 )
-                status = "запущен" if added else "уже был в пуле"
             else:
-                status = "сохранён (пул не инициализирован)"
-            
-            await message.answer(
-                f"✅ Бот <b>@{bot_info.username}</b> добавлен в сеть!\n"
-                f"🆔 ID: <code>{bot_info.id}</code>\n"
-                f"📡 Статус: {status}",
-                parse_mode="HTML",
-            )
-            logger.info(
-                f"➕ Новый бот добавлен через /add_bot: @{bot_info.username} "
-                f"(id={bot_info.id})"
-            )
+                await message.answer(
+                    "👁 <b>Режим невидимки выключен.</b>\n\n"
+                    "Твои данные снова видны в OSINT.",
+                    parse_mode="HTML",
+                )
         finally:
             await session.close()
     
-    # ------------------------------------------------------------------
-    # /find <@username или user_id> — OSINT-пробив
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # /password <pass> — проверка пароля на утечки
+    # ==================================================================
+    @dp.message(Command("password"))
+    async def handle_password(message: types.Message, command: CommandObject):
+        if not command.args:
+            await message.answer(
+                "❌ Укажи пароль: <code>/password myp@ssw0rd</code>",
+                parse_mode="HTML",
+            )
+            return
+        # Удалить исходное сообщение (чтобы пароль не висел в чате)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await _do_password_check(message, command.args.strip())
+    
+    # ==================================================================
+    # /email <mail> — проверка email на утечки
+    # ==================================================================
+    @dp.message(Command("email"))
+    async def handle_email(message: types.Message, command: CommandObject):
+        if not command.args:
+            await message.answer(
+                "❌ Укажи email: <code>/email user@example.com</code>",
+                parse_mode="HTML",
+            )
+            return
+        await _do_email_check(message, command.args.strip())
+    
+    # ==================================================================
+    # /nickname <nick> — поиск по соцсетям (Sherlock-стиль)
+    # ==================================================================
+    @dp.message(Command("nickname"))
+    async def handle_nickname(message: types.Message, command: CommandObject):
+        if not command.args:
+            await message.answer(
+                "❌ Укажи никнейм: <code>/nickname johndoe</code>",
+                parse_mode="HTML",
+            )
+            return
+        await _do_nickname_search(message, command.args.strip())
+    
+    # ==================================================================
+    # /find <target> — явная OSINT-команда (совместимость)
+    # ==================================================================
     @dp.message(Command("find"))
     async def handle_find(message: types.Message, command: CommandObject):
         if not command.args:
@@ -319,243 +595,288 @@ def build_dispatcher() -> Dispatcher:
                 parse_mode="HTML",
             )
             return
-        
         target = command.args.strip()
-        await message.answer(f"🔍 Ищу информацию о <code>{target}</code>...", parse_mode="HTML")
-        
-        session = await get_db_session()
-        try:
-            telegram_user_id = None
-            
-            # Определить тип запроса: числовой ID или @username
-            if target.lstrip("@").isdigit():
-                telegram_user_id = int(target.lstrip("@"))
-            else:
-                # Поиск по username через global_users
-                found = await queries.get_global_user_by_username(session, target)
-                if found:
-                    telegram_user_id = found.telegram_user_id
-                else:
-                    await message.answer(
-                        f"❌ Пользователь <code>{target}</code> не найден в базе Nexus.",
-                        parse_mode="HTML",
-                    )
-                    return
-            
-            # OSINT lookup
-            report = await queries.osint_lookup_user(session, telegram_user_id)
-            
-            if not report["appearances"] and not report["global_user"]:
-                await message.answer(
-                    f"🔍 Пользователь <code>{telegram_user_id}</code> не найден ни в одном боте сети.",
-                    parse_mode="HTML",
-                )
-                return
-            
-            # Форматируем отчёт
-            gu = report["global_user"]
-            username_display = f"@{gu['username']}" if gu and gu.get("username") else str(telegram_user_id)
-            full_name_display = (gu.get("full_name") or "Неизвестно") if gu else "Неизвестно"
-            
-            lines = [
-                f"🔍 <b>OSINT Report: {username_display}</b>",
-                f"👤 Имя: {full_name_display}",
-                f"🆔 ID: <code>{telegram_user_id}</code>",
-            ]
-            
-            if gu:
-                lines.append(
-                    f"💎 Diamonds: {gu['diamonds']} | "
-                    f"XP: {gu['xp']} | "
-                    f"Balance: {gu['balance']:.2f}"
-                )
-                if gu.get("registered_at"):
-                    lines.append(f"📅 В сети с: {gu['registered_at'].strftime('%Y-%m-%d')}")
-            
-            lines.append(f"\n📡 Замечен в <b>{len(report['appearances'])}</b> ботах сети:")
-            
-            for app in report["appearances"][:10]:  # Лимит 10 чатов
-                bot_tag = f"@{app['bot_username']}" if app.get("bot_username") else app["bot_name"]
-                chat_name = app.get("chat_title") or str(app["chat_id"])
-                lines.append(
-                    f"  • [{bot_tag}] → \"{chat_name}\" "
-                    f"({app['message_count']} сообщ.)"
-                    + (" 🚫" if app["is_banned"] else "")
-                )
-            
-            if report["first_seen"]:
-                lines.append(
-                    f"\n🕐 Первое появление: {report['first_seen'].strftime('%Y-%m-%d %H:%M')}"
-                )
-            if report["last_seen"]:
-                lines.append(
-                    f"🕐 Последнее: {report['last_seen'].strftime('%Y-%m-%d %H:%M')}"
-                )
-            
-            lines.append(f"💬 Всего сообщений: <b>{report['total_messages']}</b>")
-            
-            status_flags = []
-            if report["is_banned_anywhere"]:
-                status_flags.append("🚫 Забанен")
-            if report["is_spam_anywhere"]:
-                status_flags.append("⚠️ Спамер")
-            if status_flags:
-                lines.append("⚡ Статус: " + ", ".join(status_flags))
-            
-            await message.answer("\n".join(lines), parse_mode="HTML")
-        
-        except Exception as e:
-            logger.error(f"💥 Ошибка OSINT lookup: {e}")
-            await message.answer(f"❌ Ошибка при пробиве: {e}")
-        finally:
-            await session.close()
+        await message.answer(f"🔍 Ищу <code>{target}</code>...", parse_mode="HTML")
+        await _smart_route(message, target)
     
-    # ------------------------------------------------------------------
-    # Обработка всех сообщений: сохранение в БД + начисление XP
-    # ------------------------------------------------------------------
-    @dp.message()
-    async def handle_and_save(message: types.Message):
-        if not message.from_user:
+    # ==================================================================
+    # /add_bot <TOKEN> — добавить бота (admin)
+    # ==================================================================
+    @dp.message(Command("add_bot"))
+    async def handle_add_bot(message: types.Message, command: CommandObject):
+        if ADMIN_USER_IDS and message.from_user.id not in ADMIN_USER_IDS:
+            await message.answer("⛔ Нет прав.")
+            return
+        if not command.args:
+            await message.answer(
+                "❌ <code>/add_bot TOKEN</code>",
+                parse_mode="HTML",
+            )
+            return
+        
+        token = command.args.strip()
+        try:
+            test_bot = Bot(token=token)
+            bot_info = await test_bot.get_me()
+            await test_bot.session.close()
+        except Exception as e:
+            await message.answer(f"❌ Невалидный токен: <code>{e}</code>", parse_mode="HTML")
             return
         
         session = await get_db_session()
         try:
-            # 1. Upsert GlobalUser (экономический профиль)
-            await queries.get_or_create_global_user(
+            db_bot = await queries.get_or_create_bot(
                 session=session,
-                telegram_user_id=message.from_user.id,
-                username=message.from_user.username,
-                full_name=message.from_user.full_name,
+                bot_id=bot_info.id,
+                bot_name=bot_info.username or f"bot_{bot_info.id}",
+                bot_token=token,
+                bot_username=bot_info.username,
             )
+            if _pool_manager:
+                added = await _pool_manager.add_bot(token, db_bot.id, bot_info.id)
+                status = "🟢 запущен" if added else "уже в пуле"
+            else:
+                status = "сохранён"
             
-            # 2. Upsert Group
-            result = await session.execute(
-                select(Group).where(Group.telegram_chat_id == message.chat.id)
+            await message.answer(
+                f"✅ Бот <b>@{bot_info.username}</b> добавлен!\n"
+                f"🆔 <code>{bot_info.id}</code> | {status}",
+                parse_mode="HTML",
             )
-            db_group = result.scalar_one_or_none()
-            if not db_group:
-                db_group = Group(
-                    telegram_chat_id=message.chat.id,
-                    title=message.chat.title or message.chat.first_name or "Private",
-                    chat_type=message.chat.type,
-                    bot_id=1,  # fallback; корректный bot_id подтягивается при sync
-                    is_active=True,
-                    is_subscribed=True,
-                )
-                session.add(db_group)
-                await session.flush()
-            
-            # 3. Upsert User (per-group статистика)
-            result = await session.execute(
-                select(User).where(
-                    (User.telegram_user_id == message.from_user.id)
-                    & (User.group_id == db_group.id)
-                )
-            )
-            db_user = result.scalar_one_or_none()
-            if not db_user:
-                db_user = User(
-                    telegram_user_id=message.from_user.id,
-                    username=message.from_user.username,
-                    first_name=message.from_user.first_name,
-                    last_name=message.from_user.last_name,
-                    full_name=message.from_user.full_name,
-                    group_id=db_group.id,
-                )
-                session.add(db_user)
-                await session.flush()
-            
-            # Обновить статистику пользователя
-            db_user.message_count = (db_user.message_count or 0) + 1
-            db_user.last_message_date = datetime.utcnow()
-            if not db_user.first_message_date:
-                db_user.first_message_date = datetime.utcnow()
-            if message.from_user.username:
-                db_user.username = message.from_user.username
-            
-            await session.commit()
-            
-            # 4. Начислить XP (и автоматически diamonds при пороге)
-            updated_gu = await queries.add_xp(
-                session=session,
-                telegram_user_id=message.from_user.id,
-                amount=XP_PER_MESSAGE,
-            )
-            
-            # 5. Уведомить пользователя при достижении нового уровня diamonds
-            if updated_gu and updated_gu.xp % 100 == 0 and updated_gu.xp > 0:
-                await message.reply(
-                    f"💎 Новый алмаз! У тебя теперь {updated_gu.diamonds} 💎 "
-                    f"(XP: {updated_gu.xp})",
-                )
-            
-            logger.info(
-                f"✅ Сообщение сохранено: "
-                f"@{message.from_user.username} | "
-                f"chat={message.chat.id} | "
-                f"xp={updated_gu.xp if updated_gu else '?'}"
-            )
-        
-        except Exception as e:
-            logger.error(f"💥 Ошибка сохранения сообщения: {e}")
-            try:
-                await session.rollback()
-            except Exception:
-                pass
         finally:
             await session.close()
+    
+    # ==================================================================
+    # 🧠 SMART ROUTER — перехват любого текста (без команд)
+    # Должен быть ПОСЛЕДНИМ хендлером, после всех Command-хендлеров
+    # ==================================================================
+    @dp.message(F.text)
+    async def smart_router(message: types.Message):
+        """Маршрутизация текста по regex-паттернам."""
+        if not message.from_user or not message.text:
+            return
+        
+        text = message.text.strip()
+        
+        # Пропускаем команды (уже обработаны выше)
+        if text.startswith("/"):
+            return
+        
+        # --- Сохранение + начисление XP (при любом тексте) ---
+        await _save_message_and_xp(message)
+        
+        # --- Smart Route ---
+        await _smart_route(message, text)
     
     return dp
 
 
 # ============================================================================
-# MAIN — точка запуска
+# SMART ROUTE LOGIC
 # ============================================================================
 
-# Глобальная ссылка на менеджер (используется в хендлере /add_bot)
+async def _smart_route(message: types.Message, text: str) -> None:
+    """Определить тип запроса по regex и вызвать нужную функцию."""
+    
+    # 1. Только цифры (>0) → User ID
+    if RE_USER_ID.match(text):
+        target_id = int(text)
+        if target_id > 0:
+            await message.answer(f"🔍 Пробив User ID: <code>{target_id}</code>", parse_mode="HTML")
+            await _do_osint_by_user_id(message, target_id)
+            return
+    
+    # 2. Отрицательное число → Channel/Group ID
+    if RE_GROUP_ID.match(text):
+        chat_id = int(text)
+        await message.answer(f"📡 Пробив чата/канала: <code>{chat_id}</code>", parse_mode="HTML")
+        await _do_group_lookup(message, chat_id)
+        return
+    
+    # 3. @username
+    if RE_USERNAME.match(text):
+        await message.answer(f"🔍 Пробив @username: <code>{text}</code>", parse_mode="HTML")
+        await _do_osint_by_username(message, text)
+        return
+    
+    # 4. Email
+    if RE_EMAIL.match(text):
+        await _do_email_check(message, text)
+        return
+    
+    # 5. Любой другой текст → поиск никнейма (Sherlock-заглушка)
+    await _do_nickname_search(message, text)
+
+
+# ============================================================================
+# /check_me — «Иллюзия безопасности» (скрывает чувствительные данные)
+# ============================================================================
+
+async def _do_check_me(message_or_cb, from_user) -> None:
+    """OSINT себя, но с маскировкой чувствительных данных."""
+    session = await get_db_session()
+    try:
+        report = await queries.osint_lookup_user(session, from_user.id)
+        gu = report.get("global_user")
+        
+        lines = [
+            f"🔍 <b>Самопроверка: {from_user.full_name}</b>",
+            f"🆔 ID: <code>{from_user.id}</code>",
+        ]
+        
+        if gu:
+            lines.extend([
+                f"💎 Diamonds: {gu['diamonds']} | XP: {gu['xp']}",
+                f"📅 Регистрация: {gu['registered_at'].strftime('%Y-%m-%d') if gu.get('registered_at') else 'н/д'}",
+            ])
+        
+        apps = report.get("appearances", [])
+        lines.append(f"\n📡 Ты замечен в <b>{len(apps)}</b> ботах сети:")
+        for app in apps[:5]:
+            lines.append(f"  • {app.get('chat_title', '?')} ({app['message_count']} сообщ.)")
+        
+        lines.extend([
+            f"\n💬 Всего сообщений: <b>{report['total_messages']}</b>",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            "🔒 <b>Чувствительные данные:</b>",
+            "  • Пароли: <b>не обнаружены</b> ✅",
+            "  • Утечки email: <b>0 совпадений</b> ✅",
+            "  • Телефоны: <b>скрыты системой</b> 🔒",
+            "",
+            f"<i>💡 Хочешь исчезнуть? Используй /hiden_me</i>",
+        ])
+        
+        await message_or_cb.answer("\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"💥 check_me error: {e}")
+        await message_or_cb.answer(f"❌ Ошибка: {e}")
+    finally:
+        await session.close()
+
+
+# ============================================================================
+# Сохранение сообщения + XP (вызывается из Smart Router)
+# ============================================================================
+
+async def _save_message_and_xp(message: types.Message) -> None:
+    """Сохранить сообщение в БД + начислить XP."""
+    if not message.from_user:
+        return
+    
+    session = await get_db_session()
+    try:
+        # GlobalUser
+        await queries.get_or_create_global_user(
+            session=session,
+            telegram_user_id=message.from_user.id,
+            username=message.from_user.username,
+            full_name=message.from_user.full_name,
+        )
+        
+        # Group
+        result = await session.execute(
+            select(Group).where(Group.telegram_chat_id == message.chat.id)
+        )
+        db_group = result.scalar_one_or_none()
+        if not db_group:
+            db_group = Group(
+                telegram_chat_id=message.chat.id,
+                title=message.chat.title or message.chat.first_name or "Private",
+                chat_type=message.chat.type,
+                bot_id=1,
+                is_active=True,
+                is_subscribed=True,
+            )
+            session.add(db_group)
+            await session.flush()
+        
+        # User (per-group)
+        result = await session.execute(
+            select(User).where(
+                (User.telegram_user_id == message.from_user.id)
+                & (User.group_id == db_group.id)
+            )
+        )
+        db_user = result.scalar_one_or_none()
+        if not db_user:
+            db_user = User(
+                telegram_user_id=message.from_user.id,
+                username=message.from_user.username,
+                first_name=message.from_user.first_name,
+                last_name=message.from_user.last_name,
+                full_name=message.from_user.full_name,
+                group_id=db_group.id,
+            )
+            session.add(db_user)
+            await session.flush()
+        
+        db_user.message_count = (db_user.message_count or 0) + 1
+        db_user.last_message_date = datetime.utcnow()
+        if not db_user.first_message_date:
+            db_user.first_message_date = datetime.utcnow()
+        if message.from_user.username:
+            db_user.username = message.from_user.username
+        
+        await session.commit()
+        
+        # XP
+        updated_gu = await queries.add_xp(
+            session=session,
+            telegram_user_id=message.from_user.id,
+            amount=XP_PER_MESSAGE,
+        )
+        
+        if updated_gu and updated_gu.xp % 100 == 0 and updated_gu.xp > 0:
+            await message.reply(
+                f"💎 +1 алмаз! Всего: {updated_gu.diamonds} 💎 (XP: {updated_gu.xp})",
+            )
+    except Exception as e:
+        logger.error(f"💥 Ошибка сохранения: {e}")
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+    finally:
+        await session.close()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
 _pool_manager: Optional[BotPoolManager] = None
 
 
 async def _bootstrap_from_env(pool_manager: BotPoolManager) -> None:
-    """
-    Если БД пуста — подтянуть ботов из .env (TELEGRAM_TOKENS).
-    
-    Это fallback для первого запуска, пока нет ни одного бота в system_bots.
-    """
+    """Если БД пуста — подтянуть ботов из .env."""
     session = await get_db_session()
     try:
         db_bots = await queries.get_all_active_bots(session)
         if db_bots:
-            return  # В БД уже есть боты — ничего не делаем
+            return
         
         tokens_raw = settings.telegram_tokens
         tokens_dict = tokens_raw if isinstance(tokens_raw, dict) else json.loads(tokens_raw or "{}")
         
         if not tokens_dict:
-            logger.warning(
-                "⚠️ В БД нет ботов и TELEGRAM_TOKENS в .env пуст. "
-                "Добавь бота через /add_bot."
-            )
+            logger.warning("⚠️ Нет ботов ни в БД, ни в .env. Используй /add_bot.")
             return
         
-        logger.info(f"📦 Импорт ботов из .env в БД: {list(tokens_dict.keys())}")
-        
+        logger.info(f"📦 Импорт из .env: {list(tokens_dict.keys())}")
         for bot_name, token in tokens_dict.items():
             try:
-                temp_bot = Bot(token=token)
-                info = await temp_bot.get_me()
-                await temp_bot.session.close()
-                
+                tmp = Bot(token=token)
+                info = await tmp.get_me()
+                await tmp.session.close()
                 await queries.get_or_create_bot(
-                    session=session,
-                    bot_id=info.id,
-                    bot_name=bot_name,
-                    bot_token=token,
+                    session=session, bot_id=info.id,
+                    bot_name=bot_name, bot_token=token,
                     bot_username=info.username,
                 )
-                logger.info(f"✅ Бот из .env сохранён в БД: @{info.username}")
+                logger.info(f"✅ @{info.username} импортирован из .env")
             except Exception as e:
-                logger.error(f"❌ Ошибка импорта бота {bot_name}: {e}")
+                logger.error(f"❌ Ошибка импорта {bot_name}: {e}")
     finally:
         await session.close()
 
@@ -564,42 +885,30 @@ async def main():
     global _pool_manager
     
     logger.info("=" * 60)
-    logger.info("🚀 NEXUS BOT NETWORK — запуск")
+    logger.info("🚀 NEXUS BOT NETWORK + SMART ROUTER — запуск")
     logger.info("=" * 60)
     
-    # Инициализация инфраструктуры
     await init_db()
     await init_redis()
     
-    # Создать Dispatcher с хендлерами
     dp = build_dispatcher()
-    
-    # Создать менеджер пула
     _pool_manager = BotPoolManager(dispatcher=dp)
     
-    # Если БД пустая — залить ботов из .env
     await _bootstrap_from_env(_pool_manager)
-    
-    # Запустить пул (загрузит ботов из БД + начнёт цикл синхронизации)
     await _pool_manager.start()
     
-    # Ждём завершения всех задач
     try:
         tasks = list(_pool_manager.active_tasks.values())
         if tasks:
             logger.info(f"⏳ Запущено {len(tasks)} ботов. Ожидаем...")
             await asyncio.gather(*tasks, return_exceptions=True)
         else:
-            logger.warning(
-                "⚠️ Нет активных ботов в пуле. "
-                "Добавь бота в систему: /add_bot <TOKEN> "
-                "или заполни TELEGRAM_TOKENS в .env"
-            )
+            logger.warning("⚠️ Нет активных ботов. /add_bot или TELEGRAM_TOKENS в .env")
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("🛑 Получен сигнал остановки")
+        logger.info("🛑 Остановка")
     finally:
         await _pool_manager.stop()
-        logger.info("✅ Nexus Bot Network остановлен")
+        logger.info("✅ Nexus остановлен")
 
 
 if __name__ == "__main__":

@@ -46,6 +46,9 @@ class GlobalUser(Base):
     xp: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     balance: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     
+    # Флаг скрытия из OSINT-выдачи (услуга /hiden_me)
+    is_hidden: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
